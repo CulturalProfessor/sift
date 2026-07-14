@@ -1,0 +1,10 @@
+# PyTorch -> LiteRT/TFLite conversion toolchain for Sift's on-device CLIP encoders.
+# Primary path: litert-torch (Google's PyTorch->LiteRT converter, native int8 PTQ).
+# NOTE: this was formerly named ai-edge-torch, which is now deprecated and just
+# re-exports litert-torch. We depend on litert-torch directly.
+litert-torch
+# Model loading: open_clip supports both OpenAI CLIP and MobileCLIP/MobileCLIP2 variants.
+open_clip_torch
+# Preprocessing / verification.
+pillow
+numpy

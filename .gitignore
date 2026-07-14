@@ -73,3 +73,9 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Generated on-device model assets — regenerate with tools/model-conversion/build_assets.sh.
+# NOT committed: MobileCLIP weights are Apple research-only licensed (redistribution
+# restricted), and the .tflite files are large. The conversion pipeline reproduces them.
+/android/app/src/main/assets/*.tflite
+/android/app/src/main/assets/bpe_merges.txt

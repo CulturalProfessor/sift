@@ -85,6 +85,11 @@ android {
         versionCode 1
         versionName "1.0"
     }
+    // Keep .tflite models uncompressed in the APK so LiteRT can memory-map them
+    // (compressed assets can't be mmap'd and would be copied to memory instead).
+    androidResources {
+        noCompress += ["tflite"]
+    }
     signingConfigs {
         debug {
             storeFile file('debug.keystore')
@@ -110,6 +115,17 @@ android {
 dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
+
+    // TensorFlow Lite runtime for on-device MobileCLIP inference. Using the
+    // pure-Java org.tensorflow artifact rather than com.google.ai.edge.litert:
+    // the latter's Kotlin API metadata (2.3.0) is incompatible with RN 0.86's
+    // Kotlin compiler (2.1.0). Same org.tensorflow.lite.Interpreter API, and the
+    // .tflite/LiteRT model format is identical.
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
+
+    // Fresco (RN's <Image> loader) reads HEIF EXIF orientation via this class;
+    // without it, loading some gallery images crashes with NoClassDefFoundError.
+    implementation("androidx.exifinterface:exifinterface:1.4.2")
 
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
