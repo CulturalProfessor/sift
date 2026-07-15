@@ -19,6 +19,7 @@ import {
   indexVideos,
   libraryStats,
   onIndexProgress,
+  onVideoProgress,
   openInGallery,
   openVideoAt,
   type LibraryStats,
@@ -42,6 +43,7 @@ const EXAMPLE_QUERIES = [
   'people smiling',
   'documents',
   'at the beach',
+  'gym',
 ];
 
 type PermissionState = 'checking' | 'granted' | 'denied';
@@ -227,7 +229,9 @@ export function PhotoGridScreen() {
   const [permissionState, setPermissionState] =
     useState<PermissionState>('checking');
   const [stats, setStats] = useState<LibraryStats | null>(null);
-  const [indexing, setIndexing] = useState(false);
+  const [indexingPhotos, setIndexingPhotos] = useState(false);
+  const [indexingVideos, setIndexingVideos] = useState(false);
+  const indexing = indexingPhotos || indexingVideos;
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchHit[] | null>(null);
   const [searching, setSearching] = useState(false);
@@ -244,17 +248,31 @@ export function PhotoGridScreen() {
     libraryStats().then(setStats).catch(() => {});
   }, []);
 
-  const indexingRef = useRef(false);
+  const indexingPhotosRef = useRef(false);
   const startIndex = useCallback(async () => {
-    if (indexingRef.current) return;
-    indexingRef.current = true;
-    setIndexing(true);
+    if (indexingPhotosRef.current) return;
+    indexingPhotosRef.current = true;
+    setIndexingPhotos(true);
     try {
       await indexGallery(0);
       refreshStats();
     } finally {
-      indexingRef.current = false;
-      setIndexing(false);
+      indexingPhotosRef.current = false;
+      setIndexingPhotos(false);
+    }
+  }, [refreshStats]);
+
+  const indexingVideosRef = useRef(false);
+  const startVideoIndex = useCallback(async () => {
+    if (indexingVideosRef.current) return;
+    indexingVideosRef.current = true;
+    setIndexingVideos(true);
+    try {
+      await indexVideos(0);
+      refreshStats();
+    } finally {
+      indexingVideosRef.current = false;
+      setIndexingVideos(false);
     }
   }, [refreshStats]);
 
@@ -263,20 +281,21 @@ export function PhotoGridScreen() {
     refreshStats();
     // Refresh the indexed/total counts as indexing progresses (throttled by the
     // native progress cadence, which fires every ~10 items).
-    const off = onIndexProgress(() => refreshStats());
-    return off;
+    const offPhotos = onIndexProgress(() => refreshStats());
+    const offVideos = onVideoProgress(() => refreshStats());
+    return () => {
+      offPhotos();
+      offVideos();
+    };
   }, [permissionState, refreshStats]);
 
-  // Videos first (fewer), then photos. Respects the scope set in Settings.
+  // Photos and videos index concurrently on separate native threads (encoder
+  // calls are still serialized under the hood, but decode/IO overlaps).
+  // Respects the scope set in Settings.
   const runFullIndex = useCallback(() => {
-    setIndexing(true);
-    indexVideos(0)
-      .catch(() => {})
-      .finally(() => {
-        refreshStats();
-        startIndex();
-      });
-  }, [startIndex, refreshStats]);
+    startVideoIndex();
+    startIndex();
+  }, [startVideoIndex, startIndex]);
 
   // Foreground auto-index on open.
   const autoIndexed = useRef(false);

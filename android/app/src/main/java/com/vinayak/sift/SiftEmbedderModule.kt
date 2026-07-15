@@ -46,6 +46,12 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
 
     private val store by lazy { EmbeddingStore(reactContext) }
     private val indexExecutor = Executors.newSingleThreadExecutor()
+    // Runs video indexing concurrently with photo indexing rather than after it —
+    // both still funnel through imageInterpreter, which isn't thread-safe for
+    // concurrent inference, so actual encoder calls are serialized via
+    // interpreterLock. This overlaps decode/IO work but not inference itself.
+    private val videoExecutor = Executors.newSingleThreadExecutor()
+    private val interpreterLock = Any()
     // Separate from indexing so search stays responsive while a long index runs.
     private val searchExecutor = Executors.newSingleThreadExecutor()
 
@@ -190,7 +196,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     private fun embedBitmap(bitmap: Bitmap): FloatArray {
         val input = toInputBuffer(resizeCrop(bitmap))
         val output = Array(1) { FloatArray(embedDim) }
-        imageInterpreter.run(input, output)
+        synchronized(interpreterLock) { imageInterpreter.run(input, output) }
         return output[0]
     }
 
@@ -198,7 +204,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     private fun embedUri(uriString: String): FloatArray {
         val input = toInputBuffer(decodeAndCrop(uriString))
         val output = Array(1) { FloatArray(embedDim) }
-        imageInterpreter.run(input, output)
+        synchronized(interpreterLock) { imageInterpreter.run(input, output) }
         return output[0]
     }
 
@@ -596,6 +602,10 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     fun clearIndex(promise: Promise) {
         indexExecutor.execute {
             try {
+                // Photo and video indexing now run on separate executors; wait for
+                // any in-flight video pass to drain before wiping so it can't write
+                // through a clear.
+                videoExecutor.submit {}.get()
                 store.clearAll()
                 promise.resolve(null)
             } catch (e: Exception) {
@@ -715,7 +725,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     /** Incrementally keyframe gallery videos (new/changed only), prune deleted. */
     @ReactMethod
     fun indexVideos(maxCount: Int, promise: Promise) {
-        indexExecutor.execute {
+        videoExecutor.execute {
             Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
             try {
                 // Videos turned off in Settings: drop any existing keyframes and stop.
