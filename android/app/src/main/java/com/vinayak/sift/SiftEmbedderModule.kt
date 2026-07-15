@@ -1,6 +1,8 @@
 package com.vinayak.sift
 
+import android.app.ActivityManager
 import android.content.ContentUris
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
@@ -46,6 +48,53 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     private val indexExecutor = Executors.newSingleThreadExecutor()
     // Separate from indexing so search stays responsive while a long index runs.
     private val searchExecutor = Executors.newSingleThreadExecutor()
+
+    // Idle gap after each embed so the SoC can shed heat. Device-dependent default
+    // (lower-RAM phones throttle more), persisted, and overridable from Settings.
+    private val prefs by lazy {
+        reactContext.getSharedPreferences("sift_settings", Context.MODE_PRIVATE)
+    }
+
+    @Volatile
+    private var throttleMs: Long = -1
+
+    private fun deviceDefaultThrottleMs(): Long {
+        val am = reactContext.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val mi = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(mi)
+        val gb = mi.totalMem / (1024.0 * 1024 * 1024)
+        return when {
+            gb < 4.0 -> 250L // low-end (e.g. Galaxy F22): coolest
+            gb < 6.0 -> 120L // mid
+            else -> 50L // high-end: fast
+        }
+    }
+
+    private fun currentThrottleMs(): Long {
+        if (throttleMs < 0) {
+            throttleMs = prefs.getLong("throttle_ms", deviceDefaultThrottleMs())
+        }
+        return throttleMs
+    }
+
+    // --- Index scope (how far back to index, and whether to index videos) ----
+
+    private fun indexSinceMs(): Long = prefs.getLong("index_since_ms", 0L) // 0 = all time
+    private fun indexMaxFiles(): Int = prefs.getInt("index_max_files", 0) // 0 = no limit
+    private fun indexVideosEnabled(): Boolean = prefs.getBoolean("index_videos", true)
+
+    /** Cutoff for DATE_MODIFIED (seconds since epoch); 0 means no lower bound. */
+    private fun cutoffSeconds(): Long {
+        val since = indexSinceMs()
+        return if (since > 0) since / 1000 else 0
+    }
+
+    /** MediaStore selection + args for the current cutoff, or (null,null) for all. */
+    private fun dateSelection(dateCol: String): Pair<String?, Array<String>?> {
+        val cutoff = cutoffSeconds()
+        return if (cutoff > 0) "$dateCol >= ?" to arrayOf(cutoff.toString())
+        else null to null
+    }
 
     private fun interpreterOptions() = Interpreter.Options().apply {
         // Multi-threaded XNNPACK CPU inference — the Helio G80 has 8 cores and no
@@ -206,15 +255,18 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                     MediaStore.Images.Media._ID,
                     MediaStore.Images.Media.DATE_MODIFIED,
                 )
+                val (sel, selArgs) = dateSelection(MediaStore.Images.Media.DATE_MODIFIED)
                 reactContext.contentResolver.query(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
                     projection,
-                    null, null,
+                    sel, selArgs,
                     "${MediaStore.Images.Media.DATE_MODIFIED} DESC",
                 )?.use { c ->
                     val idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
                     val dmCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
+                    val cap = indexMaxFiles() // 0 = no limit; rows are DESC by date
                     while (c.moveToNext()) {
+                        if (cap > 0 && liveIds.size >= cap) break
                         val id = c.getLong(idCol)
                         val dm = c.getLong(dmCol)
                         liveIds.add(id)
@@ -238,6 +290,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                     } catch (e: Exception) {
                         // Skip unreadable images rather than aborting the whole index.
                     }
+                    Thread.sleep(currentThrottleMs()) // thermal throttle
                     done++
                     if (done % 10 == 0 || done == total) {
                         emit("SiftIndexProgress", Arguments.createMap().apply {
@@ -360,6 +413,22 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    /** Open a video in the full-screen player, seeked to [timestampMs]. */
+    @ReactMethod
+    fun openVideoAt(uri: String, timestampMs: Double, promise: Promise) {
+        try {
+            val intent = android.content.Intent(reactContext, PlayerActivity::class.java).apply {
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                putExtra("uri", uri)
+                putExtra("timestampMs", timestampMs.toLong())
+            }
+            reactContext.startActivity(intent)
+            promise.resolve(null)
+        } catch (e: Exception) {
+            promise.reject("OPEN_VIDEO_ERROR", e.message, e)
+        }
+    }
+
     /** Asset ids currently indexed, as strings — for marking indexed thumbnails. */
     @ReactMethod
     fun indexedIds(promise: Promise) {
@@ -383,6 +452,113 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(store.count())
         } catch (e: Exception) {
             promise.reject("COUNT_ERROR", e.message, e)
+        }
+    }
+
+    /** In-scope count for [uri]: date-range filtered, then capped at max files. */
+    private fun mediaStoreCount(uri: Uri, dateCol: String): Int {
+        val (sel, selArgs) = dateSelection(dateCol)
+        reactContext.contentResolver.query(
+            uri, arrayOf(MediaStore.MediaColumns._ID), sel, selArgs, null,
+        )?.use {
+            val cap = indexMaxFiles()
+            return if (cap > 0) minOf(it.count, cap) else it.count
+        }
+        return 0
+    }
+
+    /** Indexed-vs-total counts for photos and videos, for the library status UI. */
+    @ReactMethod
+    fun libraryStats(promise: Promise) {
+        searchExecutor.execute {
+            try {
+                val videosOn = indexVideosEnabled()
+                promise.resolve(Arguments.createMap().apply {
+                    putInt("photosIndexed", store.count())
+                    putInt(
+                        "photosTotal",
+                        mediaStoreCount(
+                            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                            MediaStore.Images.Media.DATE_MODIFIED,
+                        ),
+                    )
+                    putInt("videosIndexed", store.videoCount())
+                    putInt(
+                        "videosTotal",
+                        if (videosOn) mediaStoreCount(
+                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                            MediaStore.Video.Media.DATE_MODIFIED,
+                        ) else 0,
+                    )
+                    putInt("keyframes", store.keyframeCount())
+                })
+            } catch (e: Exception) {
+                promise.reject("STATS_ERROR", e.message, e)
+            }
+        }
+    }
+
+    /** All indexing settings, for the Settings screen. */
+    @ReactMethod
+    fun getSettings(promise: Promise) {
+        try {
+            promise.resolve(Arguments.createMap().apply {
+                putInt("throttleMs", currentThrottleMs().toInt())
+                putInt("deviceDefaultMs", deviceDefaultThrottleMs().toInt())
+                putDouble("indexSinceMs", indexSinceMs().toDouble())
+                putInt("indexMaxFiles", indexMaxFiles())
+                putBoolean("indexVideos", indexVideosEnabled())
+            })
+        } catch (e: Exception) {
+            promise.reject("SETTINGS_ERROR", e.message, e)
+        }
+    }
+
+    /** Set the indexing throttle (ms per embed); applies live to the running index. */
+    @ReactMethod
+    fun setIndexThrottle(ms: Double, promise: Promise) {
+        try {
+            throttleMs = ms.toLong().coerceIn(0L, 2000L)
+            prefs.edit().putLong("throttle_ms", throttleMs).apply()
+            promise.resolve(null)
+        } catch (e: Exception) {
+            promise.reject("SETTINGS_ERROR", e.message, e)
+        }
+    }
+
+    /** Wipe all indexed data (photos + video keyframes). */
+    @ReactMethod
+    fun clearIndex(promise: Promise) {
+        indexExecutor.execute {
+            try {
+                store.clearAll()
+                promise.resolve(null)
+            } catch (e: Exception) {
+                promise.reject("CLEAR_ERROR", e.message, e)
+            }
+        }
+    }
+
+    /**
+     * Set index scope: index items newer than [sinceMs] (0 = all time), at most
+     * [maxFiles] most-recent items (0 = no limit), and whether to index videos.
+     */
+    @ReactMethod
+    fun setIndexScope(
+        sinceMs: Double,
+        maxFiles: Double,
+        indexVideos: Boolean,
+        promise: Promise,
+    ) {
+        try {
+            prefs.edit()
+                .putLong("index_since_ms", sinceMs.toLong())
+                .putInt("index_max_files", maxFiles.toInt())
+                .putBoolean("index_videos", indexVideos)
+                .apply()
+            promise.resolve(null)
+        } catch (e: Exception) {
+            promise.reject("SETTINGS_ERROR", e.message, e)
         }
     }
 
@@ -460,6 +636,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                             keyframes.add(t to quantizeForStorage(emb))
                             lastStoredEmb = emb
                         }
+                        Thread.sleep(currentThrottleMs()) // thermal throttle
                     }
                 }
                 t += interval
@@ -476,6 +653,18 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
         indexExecutor.execute {
             Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
             try {
+                // Videos turned off in Settings: drop any existing keyframes and stop.
+                if (!indexVideosEnabled()) {
+                    val removed = store.pruneVideosNotIn(emptySet())
+                    promise.resolve(Arguments.createMap().apply {
+                        putInt("videosIndexed", 0)
+                        putInt("videosRemoved", removed)
+                        putInt("totalVideos", 0)
+                        putInt("totalKeyframes", 0)
+                    })
+                    return@execute
+                }
+
                 val indexed = store.indexedVideoState()
                 val liveIds = HashSet<Long>()
 
@@ -487,15 +676,18 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                     MediaStore.Video.Media.DATE_MODIFIED,
                     MediaStore.Video.Media.DURATION,
                 )
+                val (vsel, vselArgs) = dateSelection(MediaStore.Video.Media.DATE_MODIFIED)
                 reactContext.contentResolver.query(
                     MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                    projection, null, null,
+                    projection, vsel, vselArgs,
                     "${MediaStore.Video.Media.DATE_MODIFIED} DESC",
                 )?.use { c ->
                     val idCol = c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
                     val dmCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_MODIFIED)
                     val durCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
+                    val cap = indexMaxFiles() // 0 = no limit; rows are DESC by date
                     while (c.moveToNext()) {
+                        if (cap > 0 && liveIds.size >= cap) break
                         val id = c.getLong(idCol)
                         val dm = c.getLong(dmCol)
                         liveIds.add(id)

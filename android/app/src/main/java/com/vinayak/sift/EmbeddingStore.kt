@@ -120,6 +120,15 @@ class EmbeddingStore(context: Context) :
         }
     }
 
+    /** Wipe everything (photos + video keyframes) — for the Settings reset. */
+    fun clearAll() {
+        writableDatabase.apply {
+            delete("embeddings", null, null)
+            delete("video_keyframes", null, null)
+            delete("videos", null, null)
+        }
+    }
+
     // --- Video keyframes -----------------------------------------------------
 
     /** video_id -> date_modified for videos already keyframed. */

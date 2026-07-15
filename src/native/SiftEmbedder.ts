@@ -26,6 +26,14 @@ export interface VideoIndexResult {
   totalKeyframes: number;
 }
 
+export interface LibraryStats {
+  photosIndexed: number;
+  photosTotal: number;
+  videosIndexed: number;
+  videosTotal: number;
+  keyframes: number;
+}
+
 interface SiftEmbedderNative {
   embedImage(uri: string): Promise<number[]>;
   embedText(tokenIds: number[]): Promise<number[]>;
@@ -34,7 +42,25 @@ interface SiftEmbedderNative {
   indexVideos(maxCount: number): Promise<VideoIndexResult>;
   indexedCount(): Promise<number>;
   indexedIds(): Promise<string[]>;
+  libraryStats(): Promise<LibraryStats>;
+  getSettings(): Promise<IndexSettings>;
+  setIndexThrottle(ms: number): Promise<void>;
+  setIndexScope(
+    sinceMs: number,
+    maxFiles: number,
+    indexVideos: boolean,
+  ): Promise<void>;
+  clearIndex(): Promise<void>;
   readAsset(name: string): Promise<string>;
+  openVideoAt(uri: string, timestampMs: number): Promise<void>;
+}
+
+export interface IndexSettings {
+  throttleMs: number;
+  deviceDefaultMs: number;
+  indexSinceMs: number; // 0 = all time
+  indexMaxFiles: number; // 0 = no limit
+  indexVideos: boolean;
 }
 
 const { SiftEmbedder } = NativeModules as { SiftEmbedder: SiftEmbedderNative };
@@ -68,12 +94,40 @@ export function indexedCount(): Promise<number> {
   return SiftEmbedder.indexedCount();
 }
 
+export function libraryStats(): Promise<LibraryStats> {
+  return SiftEmbedder.libraryStats();
+}
+
+export function getSettings(): Promise<IndexSettings> {
+  return SiftEmbedder.getSettings();
+}
+
+export function setIndexThrottle(ms: number): Promise<void> {
+  return SiftEmbedder.setIndexThrottle(ms);
+}
+
+export function setIndexScope(
+  sinceMs: number,
+  maxFiles: number,
+  indexVideos: boolean,
+): Promise<void> {
+  return SiftEmbedder.setIndexScope(sinceMs, maxFiles, indexVideos);
+}
+
+export function clearIndex(): Promise<void> {
+  return SiftEmbedder.clearIndex();
+}
+
 export function indexedIds(): Promise<string[]> {
   return SiftEmbedder.indexedIds();
 }
 
 export function readAsset(name: string): Promise<string> {
   return SiftEmbedder.readAsset(name);
+}
+
+export function openVideoAt(uri: string, timestampMs: number): Promise<void> {
+  return SiftEmbedder.openVideoAt(uri, timestampMs);
 }
 
 export function onIndexProgress(cb: (p: IndexProgress) => void): () => void {
