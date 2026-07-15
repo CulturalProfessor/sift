@@ -1,97 +1,110 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# Sift
 
-# Getting Started
+**On-device semantic search for your photos and videos.** Type what you're
+looking for, "dog at the beach", "handwritten notes", "sunset", and Sift
+finds it, including the **exact moment inside a video**. Fully offline: no
+cloud, no account, no API cost. Runs on budget/old Android hardware, not just
+flagships.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+---
 
-## Step 1: Start Metro
+## What it does
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+- **Semantic photo search**: searches by *meaning*, not filenames or tags.
+  Uses a CLIP-style dual encoder so "food" finds your meals even with no
+  metadata.
+- **Video moment search (the differentiator)**: indexes representative
+  keyframes of each video and, on a hit, opens the video **seeked to that
+  timestamp**. Almost no offline app does this.
+- **100% on-device**: your photos and videos never leave your phone. There is
+  no server anywhere in the app.
+- **Incremental indexing**: the first index is a one-time background pass;
+  after that only new/changed items are embedded.
+- **Runs on low-end hardware**: developed and tested on a Samsung Galaxy F22
+  (MediaTek Helio G80, no NPU, 4 GB RAM).
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+## How it works
 
-```sh
-# Using npm
-npm start
+Two pipelines at different latency budgets:
 
-# OR using Yarn
-yarn start
+**Indexing (background, one-time per item)**
+1. Each photo → `MobileCLIP2-S0` image encoder (int8 TFLite via LiteRT) →
+   512-d embedding, L2-normalized and quantized to int8 (~512 bytes) in SQLite.
+2. Videos → **adaptive keyframing with a cheap pre-filter**: walk candidate
+   frames, skip ones visually near-identical to the last embedded frame
+   (16×16 grayscale diff, avoids the expensive encoder), and store a keyframe
+   only when the *embedding* shows a real scene change. Each keyframe carries
+   its timestamp.
+
+**Search (foreground, per query, target <300 ms)**
+1. Query text → CLIP BPE tokenizer (ported to TypeScript) → `MobileCLIP2-S0`
+   text encoder (int8 TFLite) → 512-d embedding.
+2. **Brute-force cosine** over all stored int8 embeddings, photos and video
+   keyframes share one vector space, so a single query ranks both. At
+   personal-library scale a linear scan is a few tens of ms; an ANN index would
+   add memory for no benefit.
+3. Results returned with a match score; video hits carry the best-matching
+   moment's timestamp.
+
+### Engineering highlights
+
+- **Self-converted, self-quantized models.** MobileCLIP2-S0 (PyTorch) →
+  float32 TFLite via `litert-torch` (perfect fidelity), then **int8** via
+  `ai-edge-quantizer`. Finding: full activation quantization destroys CLIP/ViT
+  accuracy (cosine ~0.1 to 0.3); **weight-only int8** preserves it (cosine ~0.99)
+  at 3.6× smaller. Image encoder: 13 MB. Text encoder: 65 MB.
+- **Preprocessing fidelity.** Matched the Python reference on-device to cosine
+  0.978, the key was replicating torchvision's antialiased downsampling with a
+  two-pass `inSampleSize` bitmap decode.
+- **Native performance.** Decode + preprocess + inference all run in Kotlin
+  (LiteRT, multi-threaded XNNPACK). Indexing runs at background thread priority
+  with a device-tuned thermal throttle; SQLite is in WAL mode so search stays
+  responsive during a long index.
+- **CLIP BPE tokenizer in TypeScript**: a faithful port of open_clip's
+  `SimpleTokenizer`, verified byte-for-byte against Python.
+
+## Tech stack
+
+React Native (Android-first) · Kotlin native module · LiteRT / TensorFlow Lite
+· MobileCLIP2-S0 (int8) · SQLite · ExoPlayer (media3) · TypeScript.
+
+## Build & run
+
+```bash
+# 1. Generate the bundled model assets (not committed, see "Models" below)
+cd tools/model-conversion
+uv venv --python 3.12 .venv
+VIRTUAL_ENV=.venv uv pip install -r requirements.txt
+# put ~20 images in calib_images/ (any photos), then:
+./build_assets.sh
+
+# 2. Install JS deps and run on a connected Android device
+cd ../..
+npm install
+npm start            # Metro, in one terminal
+npm run android      # build + install, in another
 ```
 
-## Step 2: Build and run your app
+Requires the Android SDK + NDK. Minimum device spec: ARM64, Android 10+.
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
+### Release APK
 
-### Android
-
-```sh
-# Using npm
-npm run android
-
-# OR using Yarn
-yarn android
+```bash
+cd android && ./gradlew assembleRelease
+# -> android/app/build/outputs/apk/release/app-release.apk (~150 MB, all ABIs)
 ```
 
-### iOS
+## Models
 
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
+The `.tflite` encoders and BPE merges are **not committed**: the MobileCLIP
+weights are under Apple's research-only license (redistribution restricted),
+and the files are large. `tools/model-conversion/build_assets.sh` reproduces
+them byte-for-byte from open_clip. To publish/distribute, swap to OpenAI CLIP
+ViT-B/32 (MIT-licensed); the conversion pipeline is model-agnostic.
 
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
+## Privacy
 
-```sh
-bundle install
-```
-
-Then, and every time you update your native dependencies, run:
-
-```sh
-bundle exec pod install
-```
-
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
-
-```sh
-# Using npm
-npm run ios
-
-# OR using Yarn
-yarn ios
-```
-
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
-
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
-
-## Step 3: Modify your app
-
-Now that you have successfully run the app, let's make changes!
-
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
-
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+Everything runs on the device. There is no network code, no analytics, no
+account. The search index lives in the app's private storage and is built by
+scanning the device's own gallery. Sharing the APK indexes the recipient's
+photos fresh; it carries no one else's data.

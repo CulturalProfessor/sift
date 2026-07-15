@@ -53,6 +53,7 @@ interface SiftEmbedderNative {
   clearIndex(): Promise<void>;
   readAsset(name: string): Promise<string>;
   openVideoAt(uri: string, timestampMs: number): Promise<void>;
+  openInGallery(uri: string, isVideo: boolean): Promise<void>;
 }
 
 export interface IndexSettings {
@@ -128,6 +129,10 @@ export function readAsset(name: string): Promise<string> {
 
 export function openVideoAt(uri: string, timestampMs: number): Promise<void> {
   return SiftEmbedder.openVideoAt(uri, timestampMs);
+}
+
+export function openInGallery(uri: string, isVideo: boolean): Promise<void> {
+  return SiftEmbedder.openInGallery(uri, isVideo);
 }
 
 export function onIndexProgress(cb: (p: IndexProgress) => void): () => void {

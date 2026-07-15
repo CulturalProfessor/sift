@@ -79,3 +79,4 @@ yarn-error.log
 # restricted), and the .tflite files are large. The conversion pipeline reproduces them.
 /android/app/src/main/assets/*.tflite
 /android/app/src/main/assets/bpe_merges.txt
+CLAUDE.md

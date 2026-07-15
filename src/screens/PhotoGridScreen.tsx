@@ -19,6 +19,7 @@ import {
   indexVideos,
   libraryStats,
   onIndexProgress,
+  openInGallery,
   openVideoAt,
   type LibraryStats,
   type SearchHit,
@@ -30,6 +31,7 @@ import { SettingsModal } from '../components/SettingsModal';
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
 const NUM_COLUMNS = 3;
+const MATCH_MIN = 40; // only show results at or above this match %
 const GAP = 2;
 const TILE = (Dimensions.get('window').width - GAP * (NUM_COLUMNS + 1)) / NUM_COLUMNS;
 
@@ -220,6 +222,7 @@ function EmptyState({
   );
 }
 
+
 export function PhotoGridScreen() {
   const [permissionState, setPermissionState] =
     useState<PermissionState>('checking');
@@ -339,6 +342,10 @@ export function PhotoGridScreen() {
   // Only treat results as "showable" when the query is non-empty — guards
   // against a stale in-flight search landing after the field was cleared.
   const hasResults = query.trim() !== '' && results !== null;
+  // Only surface confident matches.
+  const shownResults = (results ?? []).filter(
+    r => matchPercent(r.score) >= MATCH_MIN,
+  );
 
   if (permissionState === 'checking') {
     return (
@@ -385,17 +392,32 @@ export function PhotoGridScreen() {
         )}
       </View>
 
-      {hasResults && !searching && (
+      {hasResults && !searching && shownResults.length > 0 && (
         <Text style={styles.resultCount}>
-          {results!.length} results for “{query.trim()}”
+          {shownResults.length} results for “{query.trim()}”
         </Text>
       )}
 
       {searching ? (
         <SkeletonGrid />
-      ) : hasResults ? (
+      ) : !hasResults ? (
+        <EmptyState
+          stats={stats}
+          indexing={indexing}
+          onPickExample={pickExample}
+        />
+      ) : shownResults.length === 0 ? (
+        <View style={styles.noMatch}>
+          <Text style={styles.noMatchText}>
+            No strong matches for “{query.trim()}”.
+          </Text>
+          <Text style={styles.noMatchHint}>
+            Try describing it differently, or index more of your library.
+          </Text>
+        </View>
+      ) : (
         <FlatList
-          data={results ?? []}
+          data={shownResults}
           numColumns={NUM_COLUMNS}
           keyExtractor={r => `${r.assetId}${r.isVideo ? `-${r.timestampMs}` : ''}`}
           columnWrapperStyle={styles.row}
@@ -407,6 +429,8 @@ export function PhotoGridScreen() {
                   ? openVideoAt(item.uri, item.timestampMs)
                   : setViewerUri(item.uri)
               }
+              onLongPress={() => openInGallery(item.uri, item.isVideo)}
+              delayLongPress={300}
             >
               <Image source={{ uri: item.uri }} style={styles.thumbnail} />
               <View style={styles.matchBadge}>
@@ -421,12 +445,6 @@ export function PhotoGridScreen() {
               )}
             </Pressable>
           )}
-        />
-      ) : (
-        <EmptyState
-          stats={stats}
-          indexing={indexing}
-          onPickExample={pickExample}
         />
       )}
 
@@ -450,6 +468,14 @@ export function PhotoGridScreen() {
               style={styles.viewerImage}
               resizeMode="contain"
             />
+          )}
+          {viewerUri && (
+            <Pressable
+              style={styles.openGalleryBtn}
+              onPress={() => openInGallery(viewerUri, false)}
+            >
+              <Text style={styles.openGalleryText}>Open in Gallery</Text>
+            </Pressable>
           )}
         </Pressable>
       </Modal>
@@ -619,4 +645,28 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   viewerImage: { width: '100%', height: '100%' },
+  openGalleryBtn: {
+    position: 'absolute',
+    bottom: 40,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(37,99,235,0.9)',
+    paddingHorizontal: 20,
+    paddingVertical: 11,
+    borderRadius: 24,
+  },
+  openGalleryText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  noMatch: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 32,
+    paddingBottom: 80,
+  },
+  noMatchText: { color: '#e5e7eb', fontSize: 16, textAlign: 'center' },
+  noMatchHint: {
+    color: '#6b7280',
+    fontSize: 13,
+    textAlign: 'center',
+    marginTop: 8,
+  },
 });

@@ -390,7 +390,22 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                 }
                 hits.addAll(bestPerVideo.values)
 
-                val top = hits.sortedByDescending { it.score }.take(topK)
+                // Over-fetch, then drop hits whose file was deleted since the last full
+                // index (the index only prunes deletions on app open, not per-search) —
+                // check existence for just this candidate pool, not the whole library.
+                val sorted = hits.sortedByDescending { it.score }
+                val pool = sorted.take((topK * 3).coerceAtLeast(topK))
+                val livePhotoIds = existingIds(
+                    pool.filter { !it.isVideo }.map { it.id },
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                )
+                val liveVideoIds = existingIds(
+                    pool.filter { it.isVideo }.map { it.id },
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                )
+                val top = pool.filter { h ->
+                    if (h.isVideo) h.id in liveVideoIds else h.id in livePhotoIds
+                }.take(topK)
 
                 val result: WritableArray = Arguments.createArray()
                 for (h in top) {
@@ -410,6 +425,56 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
             } catch (e: Exception) {
                 promise.reject("SEARCH_ERROR", e.message, e)
             }
+        }
+    }
+
+    /** Which of [ids] still resolve to a row under [baseUri] (i.e. weren't deleted). */
+    private fun existingIds(ids: List<Long>, baseUri: Uri): Set<Long> {
+        if (ids.isEmpty()) return emptySet()
+        val live = HashSet<Long>()
+        val placeholders = ids.joinToString(",") { "?" }
+        reactContext.contentResolver.query(
+            baseUri,
+            arrayOf(MediaStore.MediaColumns._ID),
+            "${MediaStore.MediaColumns._ID} IN ($placeholders)",
+            ids.map { it.toString() }.toTypedArray(),
+            null,
+        )?.use { c ->
+            val idCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+            while (c.moveToNext()) live.add(c.getLong(idCol))
+        }
+        return live
+    }
+
+    /** Open the item in the system gallery/viewer so the user sees it in context. */
+    @ReactMethod
+    fun openExternally(uri: String, isVideo: Boolean, promise: Promise) {
+        try {
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(Uri.parse(uri), if (isVideo) "video/*" else "image/*")
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            reactContext.startActivity(intent)
+            promise.resolve(null)
+        } catch (e: Exception) {
+            promise.reject("OPEN_EXTERNAL_ERROR", e.message, e)
+        }
+    }
+
+    /** Open the item in the device's Gallery/Photos app (shows it in its album/place). */
+    @ReactMethod
+    fun openInGallery(uri: String, isVideo: Boolean, promise: Promise) {
+        try {
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(Uri.parse(uri), if (isVideo) "video/*" else "image/*")
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            reactContext.startActivity(intent)
+            promise.resolve(null)
+        } catch (e: Exception) {
+            promise.reject("OPEN_GALLERY_ERROR", e.message, e)
         }
     }
 
