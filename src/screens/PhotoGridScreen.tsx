@@ -31,7 +31,7 @@ import { SettingsModal } from '../components/SettingsModal';
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
 const NUM_COLUMNS = 3;
-const MATCH_MIN = 40; // only show results at or above this match %
+const MATCH_MIN = 60; // only show results at or above this match %
 const GAP = 2;
 const TILE = (Dimensions.get('window').width - GAP * (NUM_COLUMNS + 1)) / NUM_COLUMNS;
 
