@@ -80,3 +80,6 @@ yarn-error.log
 /android/app/src/main/assets/*.tflite
 /android/app/src/main/assets/bpe_merges.txt
 CLAUDE.md
+
+# Demo recording
+/sift_demo.mp4

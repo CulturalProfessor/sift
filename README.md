@@ -10,9 +10,8 @@ flagships.
 
 ## Demo
 
-<video src="https://github.com/CulturalProfessor/sift/raw/main/sift_demo.mp4" controls width="360"></video>
-
-Recorded on the release build, running on the Galaxy F22. 
+[**Watch the demo**](https://youtube.com/shorts/p_lwaXQBOG8?feature=share) —
+recorded on the release build, running on the Galaxy F22.
 
 ## What it does
 
