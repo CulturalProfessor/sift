@@ -8,6 +8,12 @@ flagships.
 
 ---
 
+## Demo
+
+<video src="https://github.com/CulturalProfessor/sift/raw/main/sift_demo.mp4" controls width="360"></video>
+
+Recorded on the release build, running on the Galaxy F22. 
+
 ## What it does
 
 - **Semantic photo search**: searches by *meaning*, not filenames or tags.
@@ -23,28 +29,52 @@ flagships.
 - **Runs on low-end hardware**: developed and tested on a Samsung Galaxy F22
   (MediaTek Helio G80, no NPU, 4 GB RAM).
 
-## How it works
+## Architecture
 
-Two pipelines at different latency budgets:
+Sift is a dual-encoder CLIP setup (one model, two towers: an image encoder
+and a text encoder that are trained to land related images/text in the same
+vector space) split into two pipelines with very different latency budgets.
+Everything below runs natively on-device — no server, no API call.
 
-**Indexing (background, one-time per item)**
-1. Each photo → `MobileCLIP2-S0` image encoder (int8 TFLite via LiteRT) →
-   512-d embedding, L2-normalized and quantized to int8 (~512 bytes) in SQLite.
-2. Videos → **adaptive keyframing with a cheap pre-filter**: walk candidate
-   frames, skip ones visually near-identical to the last embedded frame
-   (16×16 grayscale diff, avoids the expensive encoder), and store a keyframe
-   only when the *embedding* shows a real scene change. Each keyframe carries
-   its timestamp.
+```mermaid
+flowchart TB
+    subgraph indexing ["INDEXING — background, one-time per item, can be slow"]
+        direction TB
+        photo["📷 Photo\n(MediaStore)"] --> imgenc["MobileCLIP2-S0\nimage encoder\nint8 TFLite / LiteRT"]
+        video["🎥 Video\n(MediaStore)"] --> keyframe["Adaptive keyframing\ncheap 16×16 grayscale diff pre-filter\n→ skip near-duplicate frames"]
+        keyframe --> imgenc
+        imgenc --> quant["L2-normalize + quantize\nint8, ~512 bytes"]
+        quant --> db[("SQLite (WAL)\nasset id / timestamp → embedding")]
+    end
 
-**Search (foreground, per query, target <300 ms)**
-1. Query text → CLIP BPE tokenizer (ported to TypeScript) → `MobileCLIP2-S0`
-   text encoder (int8 TFLite) → 512-d embedding.
-2. **Brute-force cosine** over all stored int8 embeddings, photos and video
-   keyframes share one vector space, so a single query ranks both. At
-   personal-library scale a linear scan is a few tens of ms; an ANN index would
-   add memory for no benefit.
-3. Results returned with a match score; video hits carry the best-matching
-   moment's timestamp.
+    subgraph search ["SEARCH — foreground, per query, target < 300 ms"]
+        direction TB
+        query["⌨️ 'dog at the beach'"] --> tok["CLIP BPE tokenizer\n(TypeScript port)"]
+        tok --> txtenc["MobileCLIP2-S0\ntext encoder\nint8 TFLite / LiteRT"]
+        txtenc --> qemb["Query embedding\n(same 512-d space)"]
+        qemb --> cosine["Brute-force cosine similarity\nvs every stored embedding"]
+        db -. "read all vectors" .-> cosine
+        cosine --> rank["Rank + threshold\ntop-K above min match %"]
+        rank --> result["Result grid\nvideo hit → seek to matched timestamp"]
+    end
+```
+
+**Why brute-force, not ANN/HNSW**: at personal-library scale (thousands,
+even tens of thousands of items) a linear scan over int8 vectors is a few
+tens of ms — an ANN index would add build time and memory for zero benefit at
+this scale. Deliberate call, not a shortcut.
+
+**Why one embedding space for photos and video**: video keyframes are
+embedded with the exact same image encoder as photos, so a single query
+ranks both in one pass — a video hit just carries an extra timestamp field
+that triggers a seek instead of a static thumbnail open.
+
+**Indexing detail — adaptive keyframing**: naive fixed-interval sampling
+(e.g. one frame/sec) wastes encoder calls on static footage. Instead Sift
+walks candidate frames, does a cheap 16×16 grayscale diff against the *last
+stored* keyframe to skip visually near-identical frames, and only pays for
+the expensive CLIP encoder call when the diff suggests a real scene change —
+then confirms with the embedding itself before storing.
 
 ### Engineering highlights
 
