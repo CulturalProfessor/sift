@@ -10,11 +10,14 @@ import {
   View,
 } from 'react-native';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import Slider from '@react-native-community/slider';
 import {
   clearIndex,
   getSettings,
   setIndexScope,
   setIndexThrottle,
+  setMatchMin,
+  setTopK,
 } from '../native/SiftEmbedder';
 
 const DAY = 86400000;
@@ -66,11 +69,13 @@ export function SettingsModal({
   onClose,
   onScopeChanged,
   onReset,
+  onSearchSettingsChanged,
 }: {
   visible: boolean;
   onClose: () => void;
   onScopeChanged: () => void;
   onReset: () => void;
+  onSearchSettingsChanged: (matchMin: number, topK: number) => void;
 }) {
   const [throttle, setThrottle] = useState<number | null>(null);
   const [deviceDefault, setDeviceDefault] = useState<number | null>(null);
@@ -78,6 +83,8 @@ export function SettingsModal({
   const [maxFiles, setMaxFiles] = useState(0);
   const [videosOn, setVideosOn] = useState(true);
   const [showPicker, setShowPicker] = useState(false);
+  const [matchMin, setMatchMinState] = useState(60);
+  const [topK, setTopKState] = useState(5);
 
   useEffect(() => {
     if (visible) {
@@ -88,10 +95,26 @@ export function SettingsModal({
           setSinceMs(s.indexSinceMs);
           setMaxFiles(s.indexMaxFiles);
           setVideosOn(s.indexVideos);
+          setMatchMinState(s.matchMinPercent);
+          setTopKState(s.topK);
         })
         .catch(() => {});
     }
   }, [visible]);
+
+  const applyMatchMin = (percent: number) => {
+    setMatchMinState(percent);
+    setMatchMin(percent)
+      .then(() => onSearchSettingsChanged(percent, topK))
+      .catch(() => {});
+  };
+
+  const applyTopK = (k: number) => {
+    setTopKState(k);
+    setTopK(k)
+      .then(() => onSearchSettingsChanged(matchMin, k))
+      .catch(() => {});
+  };
 
   const selectSpeed = (ms: number) => {
     setThrottle(ms);
@@ -135,7 +158,43 @@ export function SettingsModal({
           </View>
 
           <ScrollView showsVerticalScrollIndicator={false}>
-            <Text style={styles.section}>How far back to index</Text>
+            <Text style={styles.section}>Minimum match</Text>
+            <Text style={styles.hint}>
+              Hide results below this match confidence.
+            </Text>
+            <View style={styles.sliderRow}>
+              <Slider
+                style={styles.slider}
+                minimumValue={0}
+                maximumValue={95}
+                step={5}
+                value={matchMin}
+                onSlidingComplete={applyMatchMin}
+                minimumTrackTintColor="#2563eb"
+                maximumTrackTintColor="#3f3f46"
+                thumbTintColor="#2563eb"
+              />
+              <Text style={styles.sliderValue}>{matchMin}%</Text>
+            </View>
+
+            <Text style={[styles.section, styles.sectionSpaced]}>Result count</Text>
+            <Text style={styles.hint}>Max results fetched per search.</Text>
+            <View style={styles.sliderRow}>
+              <Slider
+                style={styles.slider}
+                minimumValue={1}
+                maximumValue={50}
+                step={1}
+                value={topK}
+                onSlidingComplete={applyTopK}
+                minimumTrackTintColor="#2563eb"
+                maximumTrackTintColor="#3f3f46"
+                thumbTintColor="#2563eb"
+              />
+              <Text style={styles.sliderValue}>{topK}</Text>
+            </View>
+
+            <Text style={[styles.section, styles.sectionSpaced]}>How far back to index</Text>
             <Text style={styles.hint}>Only index items newer than this.</Text>
             {RANGE_PRESETS.map((p, i) => {
               const selected = rangeIdx === i;
@@ -287,6 +346,19 @@ const styles = StyleSheet.create({
   section: { color: '#fff', fontSize: 15, fontWeight: '600', marginBottom: 4 },
   sectionSpaced: { marginTop: 22 },
   hint: { color: '#6b7280', fontSize: 12, marginBottom: 14 },
+  sliderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  slider: { flex: 1, height: 40 },
+  sliderValue: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+    width: 44,
+    textAlign: 'right',
+  },
   option: {
     flexDirection: 'row',
     alignItems: 'center',

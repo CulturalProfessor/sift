@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  Alert,
   Animated,
   Dimensions,
   Easing,
@@ -15,6 +16,8 @@ import {
   View,
 } from 'react-native';
 import {
+  deleteAsset,
+  getSettings,
   indexGallery,
   indexVideos,
   libraryStats,
@@ -32,7 +35,8 @@ import { SettingsModal } from '../components/SettingsModal';
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
 const NUM_COLUMNS = 3;
-const MATCH_MIN = 60; // only show results at or above this match %
+const DEFAULT_MATCH_MIN = 60; // only show results at or above this match %, until settings load
+const DEFAULT_TOP_K = 5; // max results fetched per search, until settings load
 const GAP = 2;
 const TILE = (Dimensions.get('window').width - GAP * (NUM_COLUMNS + 1)) / NUM_COLUMNS;
 
@@ -236,7 +240,9 @@ export function PhotoGridScreen() {
   const [results, setResults] = useState<SearchHit[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [settingsVisible, setSettingsVisible] = useState(false);
-  const [viewerUri, setViewerUri] = useState<string | null>(null);
+  const [viewerItem, setViewerItem] = useState<SearchHit | null>(null);
+  const [matchMin, setMatchMin] = useState(DEFAULT_MATCH_MIN);
+  const [topK, setTopK] = useState(DEFAULT_TOP_K);
 
   useEffect(() => {
     requestMediaPermission().then(granted =>
@@ -244,35 +250,95 @@ export function PhotoGridScreen() {
     );
   }, []);
 
+  useEffect(() => {
+    getSettings()
+      .then(s => {
+        setMatchMin(s.matchMinPercent);
+        setTopK(s.topK);
+      })
+      .catch(() => {});
+  }, []);
+
+  // Called by Settings when match % or result count changes, so search
+  // behaves with the new values immediately rather than after a re-open.
+  const onSearchSettingsChanged = useCallback((min: number, k: number) => {
+    setMatchMin(min);
+    setTopK(k);
+  }, []);
+
   const refreshStats = useCallback(() => {
     libraryStats().then(setStats).catch(() => {});
   }, []);
 
-  const indexingPhotosRef = useRef(false);
+  const removeFromResults = useCallback((item: SearchHit) => {
+    setResults(prev =>
+      prev
+        ? prev.filter(
+            r => !(r.assetId === item.assetId && r.isVideo === item.isVideo),
+          )
+        : prev,
+    );
+  }, []);
+
+  const confirmDelete = useCallback(
+    (item: SearchHit) => {
+      Alert.alert(
+        'Delete this item?',
+        'This permanently removes it from your device and can’t be undone.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Delete',
+            style: 'destructive',
+            onPress: () => {
+              deleteAsset(item.uri, item.isVideo)
+                .then(deleted => {
+                  if (deleted) {
+                    removeFromResults(item);
+                    setViewerItem(cur =>
+                      cur && cur.assetId === item.assetId && cur.isVideo === item.isVideo
+                        ? null
+                        : cur,
+                    );
+                    refreshStats();
+                  }
+                })
+                .catch(() => Alert.alert('Could not delete', 'Please try again.'));
+            },
+          },
+        ],
+      );
+    },
+    [removeFromResults, refreshStats],
+  );
+
+  // Counts in-flight calls rather than blocking re-entry: a scope change while a
+  // pass is already running must still kick off a fresh (correctly-scoped) call
+  // rather than get silently dropped — the native side cancels the stale one
+  // quickly once superseded, so overlap here is brief, not wasted duplicate work.
+  const activePhotoIndexCalls = useRef(0);
   const startIndex = useCallback(async () => {
-    if (indexingPhotosRef.current) return;
-    indexingPhotosRef.current = true;
+    activePhotoIndexCalls.current++;
     setIndexingPhotos(true);
     try {
       await indexGallery(0);
       refreshStats();
     } finally {
-      indexingPhotosRef.current = false;
-      setIndexingPhotos(false);
+      activePhotoIndexCalls.current--;
+      if (activePhotoIndexCalls.current === 0) setIndexingPhotos(false);
     }
   }, [refreshStats]);
 
-  const indexingVideosRef = useRef(false);
+  const activeVideoIndexCalls = useRef(0);
   const startVideoIndex = useCallback(async () => {
-    if (indexingVideosRef.current) return;
-    indexingVideosRef.current = true;
+    activeVideoIndexCalls.current++;
     setIndexingVideos(true);
     try {
       await indexVideos(0);
       refreshStats();
     } finally {
-      indexingVideosRef.current = false;
-      setIndexingVideos(false);
+      activeVideoIndexCalls.current--;
+      if (activeVideoIndexCalls.current === 0) setIndexingVideos(false);
     }
   }, [refreshStats]);
 
@@ -323,14 +389,14 @@ export function PhotoGridScreen() {
     const seq = ++searchSeq.current;
     setSearching(true);
     try {
-      const hits = await searchByText(q, 30);
+      const hits = await searchByText(q, topK);
       if (seq === searchSeq.current) setResults(hits);
     } catch (e) {
       console.log('search error', e);
     } finally {
       if (seq === searchSeq.current) setSearching(false);
     }
-  }, []);
+  }, [topK]);
 
   useEffect(() => {
     if (query.trim() === '') {
@@ -363,7 +429,7 @@ export function PhotoGridScreen() {
   const hasResults = query.trim() !== '' && results !== null;
   // Only surface confident matches.
   const shownResults = (results ?? []).filter(
-    r => matchPercent(r.score) >= MATCH_MIN,
+    r => matchPercent(r.score) >= matchMin,
   );
 
   if (permissionState === 'checking') {
@@ -446,9 +512,22 @@ export function PhotoGridScreen() {
               onPress={() =>
                 item.isVideo
                   ? openVideoAt(item.uri, item.timestampMs)
-                  : setViewerUri(item.uri)
+                  : setViewerItem(item)
               }
-              onLongPress={() => openInGallery(item.uri, item.isVideo)}
+              onLongPress={() =>
+                Alert.alert('', undefined, [
+                  {
+                    text: 'Open in Gallery',
+                    onPress: () => openInGallery(item.uri, item.isVideo),
+                  },
+                  {
+                    text: 'Delete',
+                    style: 'destructive',
+                    onPress: () => confirmDelete(item),
+                  },
+                  { text: 'Cancel', style: 'cancel' },
+                ])
+              }
               delayLongPress={300}
             >
               <Image source={{ uri: item.uri }} style={styles.thumbnail} />
@@ -472,29 +551,38 @@ export function PhotoGridScreen() {
         onClose={() => setSettingsVisible(false)}
         onScopeChanged={onScopeChanged}
         onReset={onScopeChanged}
+        onSearchSettingsChanged={onSearchSettingsChanged}
       />
 
       <Modal
-        visible={viewerUri !== null}
+        visible={viewerItem !== null}
         transparent
         animationType="fade"
-        onRequestClose={() => setViewerUri(null)}
+        onRequestClose={() => setViewerItem(null)}
       >
-        <Pressable style={styles.viewer} onPress={() => setViewerUri(null)}>
-          {viewerUri && (
+        <Pressable style={styles.viewer} onPress={() => setViewerItem(null)}>
+          {viewerItem && (
             <Image
-              source={{ uri: viewerUri }}
+              source={{ uri: viewerItem.uri }}
               style={styles.viewerImage}
               resizeMode="contain"
             />
           )}
-          {viewerUri && (
-            <Pressable
-              style={styles.openGalleryBtn}
-              onPress={() => openInGallery(viewerUri, false)}
-            >
-              <Text style={styles.openGalleryText}>Open in Gallery</Text>
-            </Pressable>
+          {viewerItem && (
+            <View style={styles.viewerActions}>
+              <Pressable
+                style={styles.openGalleryBtn}
+                onPress={() => openInGallery(viewerItem.uri, false)}
+              >
+                <Text style={styles.openGalleryText}>Open in Gallery</Text>
+              </Pressable>
+              <Pressable
+                style={styles.deleteBtn}
+                onPress={() => confirmDelete(viewerItem)}
+              >
+                <Text style={styles.openGalleryText}>Delete</Text>
+              </Pressable>
+            </View>
           )}
         </Pressable>
       </Modal>
@@ -664,11 +752,21 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   viewerImage: { width: '100%', height: '100%' },
-  openGalleryBtn: {
+  viewerActions: {
     position: 'absolute',
     bottom: 40,
     alignSelf: 'center',
+    flexDirection: 'row',
+    gap: 10,
+  },
+  openGalleryBtn: {
     backgroundColor: 'rgba(37,99,235,0.9)',
+    paddingHorizontal: 20,
+    paddingVertical: 11,
+    borderRadius: 24,
+  },
+  deleteBtn: {
+    backgroundColor: 'rgba(220,38,38,0.9)',
     paddingHorizontal: 20,
     paddingVertical: 11,
     borderRadius: 24,

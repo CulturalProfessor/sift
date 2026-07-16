@@ -19,7 +19,7 @@ function getTokenizer(): Promise<CLIPTokenizer> {
  */
 export async function searchByText(
   query: string,
-  topK = 30,
+  topK: number,
 ): Promise<SearchHit[]> {
   const tokenizer = await getTokenizer();
   const tokens = tokenizer.tokenize(query);

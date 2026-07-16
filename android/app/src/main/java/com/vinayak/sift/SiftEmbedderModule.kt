@@ -1,14 +1,19 @@
 package com.vinayak.sift
 
+import android.app.Activity
 import android.app.ActivityManager
+import android.app.RecoverableSecurityException
 import android.content.ContentUris
 import android.content.Context
+import android.content.IntentSender
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.os.Process
 import android.provider.MediaStore
+import com.facebook.react.bridge.ActivityEventListener
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -40,6 +45,43 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
     override fun getName() = "SiftEmbedder"
+
+    // --- Delete flow: MediaStore requires user confirmation via a system dialog
+    // on API 29+, delivered back as an Activity result rather than synchronously. --
+    private val deleteRequestCode = 17583
+    private var pendingDeletePromise: Promise? = null
+    private var pendingDeleteId: Long = -1
+    private var pendingDeleteIsVideo: Boolean = false
+
+    private val activityEventListener = object : ActivityEventListener {
+        override fun onActivityResult(
+            activity: Activity,
+            requestCode: Int,
+            resultCode: Int,
+            data: android.content.Intent?,
+        ) {
+            if (requestCode != deleteRequestCode) return
+            val promise = pendingDeletePromise ?: return
+            val id = pendingDeleteId
+            val isVideo = pendingDeleteIsVideo
+            pendingDeletePromise = null
+            pendingDeleteId = -1
+            if (resultCode == Activity.RESULT_OK) {
+                if (id >= 0) {
+                    if (isVideo) store.removeVideo(id) else store.removePhoto(id)
+                }
+                promise.resolve(true)
+            } else {
+                promise.resolve(false) // user declined the system confirmation
+            }
+        }
+
+        override fun onNewIntent(intent: android.content.Intent) {}
+    }
+
+    init {
+        reactContext.addActivityEventListener(activityEventListener)
+    }
 
     private val imageSize = 256
     private val embedDim = 512
@@ -88,6 +130,18 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     private fun indexSinceMs(): Long = prefs.getLong("index_since_ms", 0L) // 0 = all time
     private fun indexMaxFiles(): Int = prefs.getInt("index_max_files", 0) // 0 = no limit
     private fun indexVideosEnabled(): Boolean = prefs.getBoolean("index_videos", true)
+
+    // --- Search tuning (match threshold, result count) ------------------------
+
+    private fun matchMinPercent(): Int = prefs.getInt("match_min_percent", 60)
+    private fun topK(): Int = prefs.getInt("top_k", 5)
+
+    // Bumped by setIndexScope. An indexGallery/indexVideos pass already running under
+    // the old scope checks this and aborts early instead of running to completion with
+    // a stale (often larger) cap — otherwise a scope change while indexing is in
+    // progress gets silently ignored until the stale pass finishes on its own.
+    @Volatile
+    private var scopeGeneration: Long = 0L
 
     /** Cutoff for DATE_MODIFIED (seconds since epoch); 0 means no lower bound. */
     private fun cutoffSeconds(): Long {
@@ -247,6 +301,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
      */
     @ReactMethod
     fun indexGallery(maxCount: Int, promise: Promise) {
+        val myGeneration = scopeGeneration
         indexExecutor.execute {
             // Background priority so foreground search preempts indexing on the CPU.
             Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
@@ -272,6 +327,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                     val dmCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
                     val cap = indexMaxFiles() // 0 = no limit; rows are DESC by date
                     while (c.moveToNext()) {
+                        if (myGeneration != scopeGeneration) break // scope changed mid-scan
                         if (cap > 0 && liveIds.size >= cap) break
                         val id = c.getLong(idCol)
                         val dm = c.getLong(dmCol)
@@ -286,10 +342,23 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
 
+                // A newer scope has since superseded this pass — bail out without
+                // pruning/embedding against what's now a stale (often larger) scope.
+                // The follow-up call the scope change triggers picks up cleanly.
+                if (myGeneration != scopeGeneration) {
+                    promise.resolve(Arguments.createMap().apply {
+                        putInt("added", 0)
+                        putInt("removed", 0)
+                        putInt("totalIndexed", store.count())
+                    })
+                    return@execute
+                }
+
                 val removed = store.pruneNotIn(liveIds)
                 val total = toEmbed.size
                 var done = 0
                 for (item in toEmbed) {
+                    if (myGeneration != scopeGeneration) break // scope changed mid-embed
                     try {
                         val emb = embedUri(item.uri)
                         store.upsert(item.id, item.dateModified, quantizeForStorage(emb))
@@ -307,7 +376,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 promise.resolve(Arguments.createMap().apply {
-                    putInt("added", total)
+                    putInt("added", done)
                     putInt("removed", removed)
                     putInt("totalIndexed", store.count())
                 })
@@ -356,6 +425,12 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
         return dot
     }
 
+    // Bumped synchronously on every searchImages call (before it's even queued), so
+    // a stale search still churning through the executor can tell it's been
+    // superseded and bail out instead of running to completion for a discarded result.
+    @Volatile
+    private var latestSearchToken: Long = 0L
+
     /**
      * Brute-force cosine search over photos AND video keyframes. Photos and
      * keyframes share one embedding space, so a single query ranks both. Video
@@ -363,9 +438,16 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
      * timestamp. Returns top-K as {assetId, uri, score, isVideo, timestampMs}.
      */
     @ReactMethod
-    fun searchImages(queryEmb: ReadableArray, topK: Int, promise: Promise) {
+    fun searchImages(queryEmb: ReadableArray, topK: Int, token: Double, promise: Promise) {
+        val myToken = token.toLong()
+        latestSearchToken = myToken
         searchExecutor.execute {
             try {
+                if (myToken != latestSearchToken) {
+                    promise.resolve(Arguments.createArray())
+                    return@execute
+                }
+
                 val q = FloatArray(embedDim) { queryEmb.getDouble(it).toFloat() }
                 var qn = 0f
                 for (v in q) qn += v * v
@@ -382,12 +464,20 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                 // Photos.
                 val hits = ArrayList<Hit>()
                 for ((id, bytes) in store.all()) {
+                    if (myToken != latestSearchToken) {
+                        promise.resolve(Arguments.createArray())
+                        return@execute
+                    }
                     hits.add(Hit(id, dotInt8(bytes, q), false, 0L))
                 }
 
                 // Video keyframes -> best moment per video.
                 val bestPerVideo = HashMap<Long, Hit>()
                 for (kf in store.allKeyframes()) {
+                    if (myToken != latestSearchToken) {
+                        promise.resolve(Arguments.createArray())
+                        return@execute
+                    }
                     val s = dotInt8(kf.embedding, q)
                     val cur = bestPerVideo[kf.videoId]
                     if (cur == null || s > cur.score) {
@@ -481,6 +571,60 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(null)
         } catch (e: Exception) {
             promise.reject("OPEN_GALLERY_ERROR", e.message, e)
+        }
+    }
+
+    /**
+     * Delete a photo/video from the device. On API 30+ this shows a system
+     * confirmation dialog (MediaStore.createDeleteRequest); the result comes back
+     * async via onActivityResult. Resolves true if deleted, false if the user
+     * declined the confirmation.
+     */
+    @ReactMethod
+    fun deleteAsset(uriString: String, isVideo: Boolean, promise: Promise) {
+        val uri = Uri.parse(uriString)
+        val id = ContentUris.parseId(uri)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val activity = reactContext.currentActivity
+                if (activity == null) {
+                    promise.reject("DELETE_ERROR", "No foreground activity")
+                    return
+                }
+                val pending = MediaStore.createDeleteRequest(
+                    reactContext.contentResolver, listOf(uri),
+                )
+                pendingDeletePromise = promise
+                pendingDeleteId = id
+                pendingDeleteIsVideo = isVideo
+                activity.startIntentSenderForResult(
+                    pending.intentSender, deleteRequestCode, null, 0, 0, 0,
+                )
+                // Resolved from activityEventListener once the system dialog returns.
+                return
+            }
+
+            try {
+                reactContext.contentResolver.delete(uri, null, null)
+                if (isVideo) store.removeVideo(id) else store.removePhoto(id)
+                promise.resolve(true)
+            } catch (e: RecoverableSecurityException) {
+                // API 29: no direct delete permission — replay via the recovery intent.
+                val activity = reactContext.currentActivity
+                if (activity == null) {
+                    promise.reject("DELETE_ERROR", "No foreground activity")
+                    return
+                }
+                pendingDeletePromise = promise
+                pendingDeleteId = id
+                pendingDeleteIsVideo = isVideo
+                val sender: IntentSender = e.userAction.actionIntent.intentSender
+                activity.startIntentSenderForResult(
+                    sender, deleteRequestCode, null, 0, 0, 0,
+                )
+            }
+        } catch (e: Exception) {
+            promise.reject("DELETE_ERROR", e.message, e)
         }
     }
 
@@ -579,6 +723,8 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                 putDouble("indexSinceMs", indexSinceMs().toDouble())
                 putInt("indexMaxFiles", indexMaxFiles())
                 putBoolean("indexVideos", indexVideosEnabled())
+                putInt("matchMinPercent", matchMinPercent())
+                putInt("topK", topK())
             })
         } catch (e: Exception) {
             promise.reject("SETTINGS_ERROR", e.message, e)
@@ -631,6 +777,29 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                 .putInt("index_max_files", maxFiles.toInt())
                 .putBoolean("index_videos", indexVideos)
                 .apply()
+            scopeGeneration++
+            promise.resolve(null)
+        } catch (e: Exception) {
+            promise.reject("SETTINGS_ERROR", e.message, e)
+        }
+    }
+
+    /** Minimum match % (of cosine similarity) for a result to be shown. */
+    @ReactMethod
+    fun setMatchMin(percent: Double, promise: Promise) {
+        try {
+            prefs.edit().putInt("match_min_percent", percent.toInt().coerceIn(0, 100)).apply()
+            promise.resolve(null)
+        } catch (e: Exception) {
+            promise.reject("SETTINGS_ERROR", e.message, e)
+        }
+    }
+
+    /** Max number of results fetched per search. */
+    @ReactMethod
+    fun setTopK(k: Double, promise: Promise) {
+        try {
+            prefs.edit().putInt("top_k", k.toInt().coerceIn(1, 100)).apply()
             promise.resolve(null)
         } catch (e: Exception) {
             promise.reject("SETTINGS_ERROR", e.message, e)
@@ -725,6 +894,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     /** Incrementally keyframe gallery videos (new/changed only), prune deleted. */
     @ReactMethod
     fun indexVideos(maxCount: Int, promise: Promise) {
+        val myGeneration = scopeGeneration
         videoExecutor.execute {
             Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
             try {
@@ -762,6 +932,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                     val durCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
                     val cap = indexMaxFiles() // 0 = no limit; rows are DESC by date
                     while (c.moveToNext()) {
+                        if (myGeneration != scopeGeneration) break // scope changed mid-scan
                         if (cap > 0 && liveIds.size >= cap) break
                         val id = c.getLong(idCol)
                         val dm = c.getLong(dmCol)
@@ -776,10 +947,21 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
 
+                if (myGeneration != scopeGeneration) {
+                    promise.resolve(Arguments.createMap().apply {
+                        putInt("videosIndexed", 0)
+                        putInt("videosRemoved", 0)
+                        putInt("totalVideos", store.videoCount())
+                        putInt("totalKeyframes", store.keyframeCount())
+                    })
+                    return@execute
+                }
+
                 val removed = store.pruneVideosNotIn(liveIds)
                 val total = toIndex.size
                 var done = 0
                 for (v in toIndex) {
+                    if (myGeneration != scopeGeneration) break // scope changed mid-embed
                     try {
                         val kfs = keyframeVideo(v.uri, v.dur)
                         store.replaceVideoKeyframes(v.id, v.dm, kfs)
@@ -794,7 +976,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 promise.resolve(Arguments.createMap().apply {
-                    putInt("videosIndexed", total)
+                    putInt("videosIndexed", done)
                     putInt("videosRemoved", removed)
                     putInt("totalVideos", store.videoCount())
                     putInt("totalKeyframes", store.keyframeCount())

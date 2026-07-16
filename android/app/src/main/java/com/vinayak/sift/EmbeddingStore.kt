@@ -120,6 +120,19 @@ class EmbeddingStore(context: Context) :
         }
     }
 
+    /** Remove a single photo's embedding (e.g. after the user deletes it in-app). */
+    fun removePhoto(assetId: Long) {
+        writableDatabase.delete("embeddings", "asset_id = ?", arrayOf(assetId.toString()))
+    }
+
+    /** Remove a single video's keyframes and index entry. */
+    fun removeVideo(videoId: Long) {
+        writableDatabase.apply {
+            delete("video_keyframes", "video_id = ?", arrayOf(videoId.toString()))
+            delete("videos", "video_id = ?", arrayOf(videoId.toString()))
+        }
+    }
+
     /** Wipe everything (photos + video keyframes) — for the Settings reset. */
     fun clearAll() {
         writableDatabase.apply {
