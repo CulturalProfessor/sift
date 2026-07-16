@@ -10,7 +10,7 @@ flagships.
 
 ## Demo
 
-[**Watch the demo**](https://youtube.com/shorts/p_lwaXQBOG8?feature=share) —
+[**Watch the demo**](https://youtube.com/shorts/p_lwaXQBOG8?feature=share),
 recorded on the release build, running on the Galaxy F22.
 
 ## What it does
@@ -33,11 +33,11 @@ recorded on the release build, running on the Galaxy F22.
 Sift is a dual-encoder CLIP setup (one model, two towers: an image encoder
 and a text encoder that are trained to land related images/text in the same
 vector space) split into two pipelines with very different latency budgets.
-Everything below runs natively on-device — no server, no API call.
+Everything below runs natively on-device: no server, no API call.
 
 ```mermaid
 flowchart TB
-    subgraph indexing ["INDEXING — background, one-time per item, can be slow"]
+    subgraph indexing ["INDEXING (background, one-time per item, can be slow)"]
         direction TB
         photo["📷 Photo\n(MediaStore)"] --> imgenc["MobileCLIP2-S0\nimage encoder\nint8 TFLite / LiteRT"]
         video["🎥 Video\n(MediaStore)"] --> keyframe["Adaptive keyframing\ncheap 16×16 grayscale diff pre-filter\n→ skip near-duplicate frames"]
@@ -46,7 +46,7 @@ flowchart TB
         quant --> db[("SQLite (WAL)\nasset id / timestamp → embedding")]
     end
 
-    subgraph search ["SEARCH — foreground, per query, target < 300 ms"]
+    subgraph search ["SEARCH (foreground, per query, target < 300 ms)"]
         direction TB
         query["⌨️ 'dog at the beach'"] --> tok["CLIP BPE tokenizer\n(TypeScript port)"]
         tok --> txtenc["MobileCLIP2-S0\ntext encoder\nint8 TFLite / LiteRT"]
@@ -60,19 +60,19 @@ flowchart TB
 
 **Why brute-force, not ANN/HNSW**: at personal-library scale (thousands,
 even tens of thousands of items) a linear scan over int8 vectors is a few
-tens of ms — an ANN index would add build time and memory for zero benefit at
-this scale. Deliberate call, not a shortcut.
+tens of ms, while an ANN index would add build time and memory for zero
+benefit at this scale. Deliberate call, not a shortcut.
 
 **Why one embedding space for photos and video**: video keyframes are
 embedded with the exact same image encoder as photos, so a single query
-ranks both in one pass — a video hit just carries an extra timestamp field
+ranks both in one pass; a video hit just carries an extra timestamp field
 that triggers a seek instead of a static thumbnail open.
 
-**Indexing detail — adaptive keyframing**: naive fixed-interval sampling
+**Indexing detail: adaptive keyframing**. Naive fixed-interval sampling
 (e.g. one frame/sec) wastes encoder calls on static footage. Instead Sift
 walks candidate frames, does a cheap 16×16 grayscale diff against the *last
 stored* keyframe to skip visually near-identical frames, and only pays for
-the expensive CLIP encoder call when the diff suggests a real scene change —
+the expensive CLIP encoder call when the diff suggests a real scene change,
 then confirms with the embedding itself before storing.
 
 ### Engineering highlights
