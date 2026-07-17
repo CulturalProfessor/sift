@@ -7,6 +7,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
+import android.os.PowerManager
 import android.os.Process
 import android.provider.MediaStore
 import android.util.Log
@@ -85,6 +87,46 @@ class SiftIndexer(
     fun setThrottleMs(ms: Long) {
         throttleMs = ms
         prefs.edit().putLong("throttle_ms", ms).apply()
+    }
+
+    private val powerManager by lazy {
+        context.getSystemService(Context.POWER_SERVICE) as PowerManager
+    }
+
+    /**
+     * Thermal-aware throttle: scales the user's chosen speed (Eco/Balanced/Fast,
+     * [currentThrottleMs]) by real-time thermal headroom (API 30+,
+     * [PowerManager.getThermalHeadroom]) instead of sleeping a flat amount
+     * regardless of actual device temperature. A cool device backs off toward a
+     * floor (Eco doesn't idle when there's no heat to manage); a device
+     * approaching thermal throttling scales up toward a ceiling (Fast stays
+     * safe instead of cooking the SoC). Falls back to the flat baseline on
+     * API < 30 or if the platform can't report headroom (not all chipsets do).
+     */
+    fun effectiveThrottleMs(): Long {
+        val baseline = currentThrottleMs()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return baseline
+
+        val headroom = try {
+            // Forecast a few seconds out so the throttle reacts before a
+            // sustained embed loop actually trips thermal throttling.
+            powerManager.getThermalHeadroom(5)
+        } catch (e: Exception) {
+            Float.NaN
+        }
+        if (headroom.isNaN()) return baseline
+
+        // 1.0 headroom is nominally "at the throttling threshold"; 0 is cool.
+        val floor = (baseline * 0.4).toLong().coerceAtLeast(15L)
+        val ceiling = (baseline * 2.5).toLong().coerceAtMost(2000L)
+        val scaled = when {
+            headroom <= 0.5f -> floor + ((baseline - floor) * (headroom / 0.5f)).toLong()
+            else -> {
+                val hot = (headroom - 0.5f).coerceAtMost(1.5f) / 1.5f
+                baseline + ((ceiling - baseline) * hot).toLong()
+            }
+        }
+        return scaled.coerceIn(floor, ceiling)
     }
 
     // --- Index scope (how far back to index, and whether to index videos) ----
@@ -303,7 +345,7 @@ class SiftIndexer(
                 failed++
                 Log.w(TAG, "Failed to embed photo ${item.id}: ${e.message}")
             }
-            Thread.sleep(currentThrottleMs()) // thermal throttle
+            Thread.sleep(effectiveThrottleMs()) // thermal-aware throttle
             done++
             if (done % 10 == 0 || done == total) onPhotoProgress(done, total)
         }
@@ -385,7 +427,7 @@ class SiftIndexer(
                             keyframes.add(t to quantizeForStorage(emb))
                             lastStoredEmb = emb
                         }
-                        Thread.sleep(currentThrottleMs()) // thermal throttle
+                        Thread.sleep(effectiveThrottleMs()) // thermal-aware throttle
                     }
                 }
                 t += interval
