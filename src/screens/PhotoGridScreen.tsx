@@ -16,10 +16,8 @@ import {
   View,
 } from 'react-native';
 import {
-  addRecentQuery,
   cancelVoiceSearch,
   deleteAsset,
-  getRecentQueries,
   getSettings,
   indexGallery,
   indexVideos,
@@ -295,8 +293,6 @@ export function PhotoGridScreen() {
   // Non-null while showing "find similar" results instead of a text search.
   const [similarTo, setSimilarTo] = useState<SearchHit | null>(null);
   const [searchError, setSearchError] = useState(false);
-  const [recentQueries, setRecentQueries] = useState<string[]>([]);
-  const [searchFocused, setSearchFocused] = useState(false);
   const [failedCount, setFailedCount] = useState(0);
   const [voiceAvailable, setVoiceAvailable] = useState(false);
   const [listening, setListening] = useState(false);
@@ -321,16 +317,6 @@ export function PhotoGridScreen() {
       })
       .catch(e => console.log('getSettings failed', e));
   }, []);
-
-  const refreshRecentQueries = useCallback(() => {
-    getRecentQueries()
-      .then(setRecentQueries)
-      .catch(e => console.log('getRecentQueries failed', e));
-  }, []);
-
-  useEffect(() => {
-    refreshRecentQueries();
-  }, [refreshRecentQueries]);
 
   // Called by Settings when match % or result count changes, so search
   // behaves with the new values immediately rather than after a re-open.
@@ -469,12 +455,7 @@ export function PhotoGridScreen() {
     setSearchError(false);
     try {
       const hits = await searchByText(q, topK);
-      if (seq === searchSeq.current) {
-        setResults(hits);
-        addRecentQuery(q)
-          .then(refreshRecentQueries)
-          .catch(e => console.log('addRecentQuery failed', e));
-      }
+      if (seq === searchSeq.current) setResults(hits);
     } catch (e) {
       console.log('search error', e);
       if (seq === searchSeq.current) {
@@ -484,7 +465,7 @@ export function PhotoGridScreen() {
     } finally {
       if (seq === searchSeq.current) setSearching(false);
     }
-  }, [topK, refreshRecentQueries]);
+  }, [topK]);
 
   const startListening = useCallback(async () => {
     const granted = await requestMicPermission();
@@ -580,13 +561,6 @@ export function PhotoGridScreen() {
   // is active — guards against a stale in-flight search landing after the
   // query was cleared.
   const hasResults = (query.trim() !== '' || similarTo !== null) && results !== null;
-  const showRecentQueries =
-    searchFocused &&
-    !searching &&
-    !searchError &&
-    query.trim() === '' &&
-    similarTo === null &&
-    recentQueries.length > 0;
   // Only surface confident matches.
   const shownResults = (results ?? []).filter(
     r => matchPercent(r.score) >= matchMin,
@@ -620,8 +594,6 @@ export function PhotoGridScreen() {
           value={query}
           onChangeText={setQuery}
           onSubmitEditing={() => runSearch(query)}
-          onFocus={() => setSearchFocused(true)}
-          onBlur={() => setSearchFocused(false)}
           returnKeyType="search"
           autoCapitalize="none"
         />
@@ -660,19 +632,6 @@ export function PhotoGridScreen() {
         )}
       </View>
 
-      {showRecentQueries && (
-        <View style={styles.chips}>
-          {recentQueries.map(q => (
-            <Pressable
-              key={q}
-              onPress={() => pickExample(q)}
-              style={styles.chip}
-            >
-              <Text style={styles.chipText}>{q}</Text>
-            </Pressable>
-          ))}
-        </View>
-      )}
 
       {hasResults && !searching && shownResults.length > 0 && (
         <Text style={styles.resultCount}>
