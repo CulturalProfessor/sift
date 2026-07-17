@@ -50,3 +50,20 @@ export async function searchByText(
 
   return searchImages(queryEmbedding, topK);
 }
+
+// CLIP cosine scores sit ~0.15-0.32 for good matches; map to a friendlier
+// "match %" so the number reads meaningfully to a user. Prompt-templated
+// queries shift this distribution vs. raw-query scores, so these need
+// re-tuning against real on-device queries.
+export const SCORE_FLOOR = 0.1; // score mapped to 0%
+export const SCORE_CEILING = 0.3; // score mapped to 100%
+
+export function matchPercent(score: number): number {
+  return Math.max(
+    1,
+    Math.min(
+      99,
+      Math.round(((score - SCORE_FLOOR) / (SCORE_CEILING - SCORE_FLOOR)) * 100),
+    ),
+  );
+}

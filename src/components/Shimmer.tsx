@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { Animated, Easing, StyleSheet, View, type ViewStyle } from 'react-native';
+import { colors } from '../theme';
 
 /**
  * A dependency-free shimmer box: a dark placeholder with a soft light band that
@@ -39,7 +40,7 @@ export function Shimmer({
   return (
     <View
       style={[
-        { width, height, borderRadius: radius, backgroundColor: '#1f2937' },
+        { width, height, borderRadius: radius, backgroundColor: colors.skeleton },
         styles.clip,
         style,
       ]}

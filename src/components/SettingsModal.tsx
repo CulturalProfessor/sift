@@ -11,6 +11,7 @@ import {
 } from 'react-native';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import Slider from '@react-native-community/slider';
+import { colors } from '../theme';
 import {
   clearIndex,
   getSettings,
@@ -152,7 +153,12 @@ export function SettingsModal({
         <Pressable style={styles.sheet} onPress={() => {}}>
           <View style={styles.header}>
             <Text style={styles.title}>Settings</Text>
-            <Pressable onPress={onClose} hitSlop={12}>
+            <Pressable
+              onPress={onClose}
+              hitSlop={12}
+              accessibilityLabel="Close settings"
+              accessibilityRole="button"
+            >
               <Text style={styles.close}>✕</Text>
             </Pressable>
           </View>
@@ -170,9 +176,9 @@ export function SettingsModal({
                 step={5}
                 value={matchMin}
                 onSlidingComplete={applyMatchMin}
-                minimumTrackTintColor="#2563eb"
-                maximumTrackTintColor="#3f3f46"
-                thumbTintColor="#2563eb"
+                minimumTrackTintColor={colors.accent}
+                maximumTrackTintColor={colors.borderMuted}
+                thumbTintColor={colors.accent}
               />
               <Text style={styles.sliderValue}>{matchMin}%</Text>
             </View>
@@ -187,9 +193,9 @@ export function SettingsModal({
                 step={1}
                 value={topK}
                 onSlidingComplete={applyTopK}
-                minimumTrackTintColor="#2563eb"
-                maximumTrackTintColor="#3f3f46"
-                thumbTintColor="#2563eb"
+                minimumTrackTintColor={colors.accent}
+                maximumTrackTintColor={colors.borderMuted}
+                thumbTintColor={colors.accent}
               />
               <Text style={styles.sliderValue}>{topK}</Text>
             </View>
@@ -270,8 +276,8 @@ export function SettingsModal({
               <Switch
                 value={videosOn}
                 onValueChange={v => applyScope(sinceMs, maxFiles, v)}
-                trackColor={{ true: '#2563eb', false: '#3f3f46' }}
-                thumbColor="#fff"
+                trackColor={{ true: colors.accent, false: colors.borderMuted }}
+                thumbColor={colors.text}
               />
             </Pressable>
 
@@ -326,14 +332,14 @@ export function SettingsModal({
 const styles = StyleSheet.create({
   backdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'flex-end' },
   sheet: {
-    backgroundColor: '#141414',
+    backgroundColor: colors.surfaceRaised,
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     padding: 20,
     paddingBottom: 34,
     maxHeight: '88%',
     borderTopWidth: 1,
-    borderColor: '#262626',
+    borderColor: colors.border,
   },
   header: {
     flexDirection: 'row',
@@ -341,11 +347,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 18,
   },
-  title: { color: '#fff', fontSize: 20, fontWeight: '700' },
-  close: { color: '#9ca3af', fontSize: 18 },
-  section: { color: '#fff', fontSize: 15, fontWeight: '600', marginBottom: 4 },
+  title: { color: colors.text, fontSize: 20, fontWeight: '700' },
+  close: { color: colors.textMuted, fontSize: 18 },
+  section: { color: colors.text, fontSize: 15, fontWeight: '600', marginBottom: 4 },
   sectionSpaced: { marginTop: 22 },
-  hint: { color: '#6b7280', fontSize: 12, marginBottom: 14 },
+  hint: { color: colors.textFaint, fontSize: 12, marginBottom: 14 },
   sliderRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -353,7 +359,7 @@ const styles = StyleSheet.create({
   },
   slider: { flex: 1, height: 40 },
   sliderValue: {
-    color: '#fff',
+    color: colors.text,
     fontSize: 14,
     fontWeight: '600',
     width: 44,
@@ -367,13 +373,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#262626',
+    borderColor: colors.border,
     marginBottom: 10,
   },
-  optionSelected: { borderColor: '#2563eb', backgroundColor: '#0f1729' },
+  optionSelected: { borderColor: colors.accent, backgroundColor: colors.accentSurface },
   optionLeft: { flex: 1, paddingRight: 12 },
-  optionLabel: { color: '#fff', fontSize: 15, fontWeight: '500' },
-  optionDesc: { color: '#6b7280', fontSize: 12, marginTop: 2 },
+  optionLabel: { color: colors.text, fontSize: 15, fontWeight: '500' },
+  optionDesc: { color: colors.textFaint, fontSize: 12, marginTop: 2 },
   toggleRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -382,7 +388,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#262626',
+    borderColor: colors.border,
     marginTop: 4,
   },
   radio: {
@@ -390,21 +396,21 @@ const styles = StyleSheet.create({
     height: 22,
     borderRadius: 11,
     borderWidth: 2,
-    borderColor: '#4b5563',
+    borderColor: colors.radioBorder,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  radioOn: { borderColor: '#2563eb' },
-  radioDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: '#2563eb' },
+  radioOn: { borderColor: colors.accent },
+  radioDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: colors.accent },
   resetBtn: {
     paddingVertical: 13,
     paddingHorizontal: 14,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#3f1d1d',
-    backgroundColor: '#1a0f0f',
+    borderColor: colors.dangerBorder,
+    backgroundColor: colors.dangerSurface,
     alignItems: 'center',
   },
-  resetText: { color: '#f87171', fontSize: 15, fontWeight: '500' },
-  about: { color: '#9ca3af', fontSize: 13, lineHeight: 20, marginBottom: 10 },
+  resetText: { color: colors.dangerText, fontSize: 15, fontWeight: '500' },
+  about: { color: colors.textMuted, fontSize: 13, lineHeight: 20, marginBottom: 10 },
 });

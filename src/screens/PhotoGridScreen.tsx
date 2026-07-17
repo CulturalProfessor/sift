@@ -34,9 +34,10 @@ import {
   type LibraryStats,
   type SearchHit,
 } from '../native/SiftEmbedder';
-import { searchByText } from '../native/search';
+import { matchPercent, searchByText } from '../native/search';
 import { Shimmer } from '../components/Shimmer';
 import { SettingsModal } from '../components/SettingsModal';
+import { colors } from '../theme';
 
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
@@ -94,22 +95,6 @@ function formatTimestamp(ms: number): string {
   const m = Math.floor(totalSec / 60);
   const s = totalSec % 60;
   return `${m}:${s.toString().padStart(2, '0')}`;
-}
-
-// CLIP cosine scores sit ~0.15-0.32 for good matches; map to a friendlier
-// "match %" so the number reads meaningfully to a user. Prompt-templated
-// queries (see native/search.ts) shift this distribution vs. raw-query
-// scores, so these need re-tuning against real on-device queries.
-const SCORE_FLOOR = 0.1; // score mapped to 0%
-const SCORE_CEILING = 0.3; // score mapped to 100%
-function matchPercent(score: number): number {
-  return Math.max(
-    1,
-    Math.min(
-      99,
-      Math.round(((score - SCORE_FLOOR) / (SCORE_CEILING - SCORE_FLOOR)) * 100),
-    ),
-  );
 }
 
 /** Thin determinate progress bar for "N / total" indexing counts. */
@@ -232,11 +217,11 @@ function EmptyState({
                 {
                   borderColor: a.interpolate({
                     inputRange: [0, 1],
-                    outputRange: ['#2a2a2a', '#3b82f6'],
+                    outputRange: [colors.borderLight, colors.accentStrong],
                   }),
                   backgroundColor: a.interpolate({
                     inputRange: [0, 1],
-                    outputRange: ['#171717', '#182541'],
+                    outputRange: [colors.chip, colors.accentSurfaceAlt],
                   }),
                   transform: [
                     {
@@ -631,7 +616,7 @@ export function PhotoGridScreen() {
         <TextInput
           style={styles.searchInput}
           placeholder="Search your photos & videos…"
-          placeholderTextColor="#6b7280"
+          placeholderTextColor={colors.textFaint}
           value={query}
           onChangeText={setQuery}
           onSubmitEditing={() => runSearch(query)}
@@ -650,7 +635,7 @@ export function PhotoGridScreen() {
             {listening ? (
               <View style={styles.stopIcon} />
             ) : (
-              <MicIcon color="#9ca3af" />
+              <MicIcon color={colors.textMuted} />
             )}
           </Pressable>
         )}
@@ -826,16 +811,16 @@ export function PhotoGridScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0a0a0a' },
+  container: { flex: 1, backgroundColor: colors.background },
   center: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
     padding: 24,
-    backgroundColor: '#0a0a0a',
+    backgroundColor: colors.background,
   },
-  message: { color: '#fff', textAlign: 'center', fontSize: 16 },
-  deniedText: { color: '#9ca3af', fontSize: 14, marginTop: 14 },
+  message: { color: colors.text, textAlign: 'center', fontSize: 16 },
+  deniedText: { color: colors.textMuted, fontSize: 14, marginTop: 14 },
 
   searchRow: {
     flexDirection: 'row',
@@ -846,27 +831,27 @@ const styles = StyleSheet.create({
   },
   searchInput: {
     flex: 1,
-    backgroundColor: '#1a1a1a',
-    color: '#fff',
+    backgroundColor: colors.surface,
+    color: colors.text,
     borderRadius: 12,
     paddingHorizontal: 14,
     paddingVertical: 11,
     fontSize: 15,
     borderWidth: 1,
-    borderColor: '#262626',
+    borderColor: colors.border,
   },
   iconButton: {
-    backgroundColor: '#1a1a1a',
+    backgroundColor: colors.surface,
     width: 42,
     height: 42,
     borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
-    borderColor: '#262626',
+    borderColor: colors.border,
   },
-  iconButtonText: { color: '#9ca3af', fontSize: 16 },
-  iconButtonActive: { backgroundColor: '#3b0d0d', borderColor: '#dc2626' },
+  iconButtonText: { color: colors.textMuted, fontSize: 16 },
+  iconButtonActive: { backgroundColor: colors.dangerSurfaceStrong, borderColor: colors.danger },
   micIcon: {
     width: 16,
     height: 18,
@@ -900,11 +885,11 @@ const styles = StyleSheet.create({
     width: 12,
     height: 12,
     borderRadius: 2,
-    backgroundColor: '#f87171',
+    backgroundColor: colors.dangerText,
   },
 
   resultCount: {
-    color: '#9ca3af',
+    color: colors.textMuted,
     fontSize: 13,
     paddingHorizontal: 14,
     paddingVertical: 10,
@@ -912,7 +897,7 @@ const styles = StyleSheet.create({
 
   row: { gap: GAP, paddingHorizontal: GAP },
   gridContent: { gap: GAP, paddingTop: 8 },
-  thumbnail: { width: TILE, height: TILE, borderRadius: 4, backgroundColor: '#1a1a1a' },
+  thumbnail: { width: TILE, height: TILE, borderRadius: 4, backgroundColor: colors.surface },
   videoBadge: {
     position: 'absolute',
     bottom: 6,
@@ -922,7 +907,7 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
     borderRadius: 4,
   },
-  videoBadgeText: { color: '#fff', fontSize: 11, fontWeight: '600' },
+  videoBadgeText: { color: colors.text, fontSize: 11, fontWeight: '600' },
 
   skeletonGrid: {
     flexDirection: 'row',
@@ -941,13 +926,13 @@ const styles = StyleSheet.create({
     paddingBottom: 60,
   },
   heroMark: {
-    color: '#fff',
+    color: colors.text,
     fontSize: 46,
     fontWeight: '800',
     letterSpacing: -1,
   },
   heroTagline: {
-    color: '#9ca3af',
+    color: colors.textMuted,
     fontSize: 15,
     textAlign: 'center',
     marginTop: 10,
@@ -962,9 +947,9 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
     borderRadius: 4,
   },
-  matchText: { color: '#e5e7eb', fontSize: 10.5, fontWeight: '700' },
+  matchText: { color: colors.textSecondary, fontSize: 10.5, fontWeight: '700' },
   tryHint: {
-    color: '#6b7280',
+    color: colors.textFaint,
     fontSize: 12,
     marginTop: 30,
     marginBottom: 12,
@@ -976,21 +961,21 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   chip: {
-    backgroundColor: '#171717',
+    backgroundColor: colors.chip,
     borderWidth: 1,
-    borderColor: '#2a2a2a',
+    borderColor: colors.borderLight,
     paddingHorizontal: 14,
     paddingVertical: 8,
     borderRadius: 20,
   },
-  chipText: { color: '#d1d5db', fontSize: 13 },
+  chipText: { color: colors.textTertiary, fontSize: 13 },
 
   indexStatus: {
     alignItems: 'center',
     marginTop: 40,
   },
   indexStatusText: {
-    color: '#6b7280',
+    color: colors.textFaint,
     fontSize: 12,
     textAlign: 'center',
     lineHeight: 18,
@@ -1000,14 +985,14 @@ const styles = StyleSheet.create({
     width: 200,
     height: 4,
     borderRadius: 2,
-    backgroundColor: '#262626',
+    backgroundColor: colors.border,
     marginTop: 4,
     overflow: 'hidden',
   },
   progressFill: {
     height: '100%',
     borderRadius: 2,
-    backgroundColor: '#3b82f6',
+    backgroundColor: colors.accentStrong,
   },
   indexingRow: {
     flexDirection: 'row',
@@ -1015,9 +1000,9 @@ const styles = StyleSheet.create({
     gap: 6,
     marginTop: 8,
   },
-  indexingText: { color: '#6b7280', fontSize: 12 },
+  indexingText: { color: colors.textFaint, fontSize: 12 },
   indexHelp: {
-    color: '#6b7280',
+    color: colors.textFaint,
     fontSize: 11.5,
     textAlign: 'center',
     lineHeight: 17,
@@ -1025,7 +1010,7 @@ const styles = StyleSheet.create({
     maxWidth: 300,
   },
   indexFailedText: {
-    color: '#f59e0b',
+    color: colors.warning,
     fontSize: 11.5,
     textAlign: 'center',
     marginTop: 10,
@@ -1034,7 +1019,7 @@ const styles = StyleSheet.create({
     width: 8,
     height: 8,
     borderRadius: 4,
-    backgroundColor: '#22c55e',
+    backgroundColor: colors.success,
   },
   viewer: {
     flex: 1,
@@ -1062,7 +1047,7 @@ const styles = StyleSheet.create({
     paddingVertical: 11,
     borderRadius: 24,
   },
-  openGalleryText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  openGalleryText: { color: colors.text, fontSize: 14, fontWeight: '600' },
   noMatch: {
     flex: 1,
     alignItems: 'center',
@@ -1070,9 +1055,9 @@ const styles = StyleSheet.create({
     padding: 32,
     paddingBottom: 80,
   },
-  noMatchText: { color: '#e5e7eb', fontSize: 16, textAlign: 'center' },
+  noMatchText: { color: colors.textSecondary, fontSize: 16, textAlign: 'center' },
   noMatchHint: {
-    color: '#6b7280',
+    color: colors.textFaint,
     fontSize: 13,
     textAlign: 'center',
     marginTop: 8,
@@ -1084,5 +1069,5 @@ const styles = StyleSheet.create({
     padding: 32,
     paddingBottom: 80,
   },
-  errorText: { color: '#f87171', fontSize: 15, textAlign: 'center' },
+  errorText: { color: colors.dangerText, fontSize: 15, textAlign: 'center' },
 });
