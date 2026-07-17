@@ -1,17 +1,12 @@
 package com.vinayak.sift
 
 import android.app.Activity
-import android.app.ActivityManager
 import android.app.RecoverableSecurityException
 import android.content.ContentUris
 import android.content.Context
 import android.content.IntentSender
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
-import android.os.Process
 import android.provider.MediaStore
 import com.facebook.react.bridge.ActivityEventListener
 import com.facebook.react.bridge.Arguments
@@ -24,13 +19,11 @@ import com.facebook.react.bridge.WritableArray
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.io.FileInputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.util.concurrent.Executors
-import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import org.json.JSONArray
 import org.tensorflow.lite.Interpreter
 
 /**
@@ -83,87 +76,92 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
         reactContext.addActivityEventListener(activityEventListener)
     }
 
-    private val imageSize = 256
-    private val embedDim = 512
-
-    private val store by lazy { EmbeddingStore(reactContext) }
     private val indexExecutor = Executors.newSingleThreadExecutor()
     // Runs video indexing concurrently with photo indexing rather than after it —
-    // both still funnel through imageInterpreter, which isn't thread-safe for
-    // concurrent inference, so actual encoder calls are serialized via
-    // interpreterLock. This overlaps decode/IO work but not inference itself.
+    // both still funnel through the image encoder, which isn't thread-safe for
+    // concurrent inference, so actual encoder calls are serialized inside
+    // SiftIndexer. This overlaps decode/IO work but not inference itself.
     private val videoExecutor = Executors.newSingleThreadExecutor()
-    private val interpreterLock = Any()
     // Separate from indexing so search stays responsive while a long index runs.
     private val searchExecutor = Executors.newSingleThreadExecutor()
 
-    // Idle gap after each embed so the SoC can shed heat. Device-dependent default
-    // (lower-RAM phones throttle more), persisted, and overridable from Settings.
+    // Owns the image encoder, the embedding store, and the indexing passes —
+    // shared with the WorkManager worker so in-app and background indexing
+    // drive the same core.
+    private val indexer by lazy {
+        SiftIndexer(
+            reactContext,
+            onPhotoProgress = { done, total ->
+                photoDone = done; photoTotal = total
+                emit("SiftIndexProgress", Arguments.createMap().apply {
+                    putInt("done", done)
+                    putInt("total", total)
+                })
+                IndexingService.updateProgress(photoDone, photoTotal, videoDone, videoTotal)
+            },
+            onVideoProgress = { done, total ->
+                videoDone = done; videoTotal = total
+                emit("SiftVideoProgress", Arguments.createMap().apply {
+                    putInt("done", done)
+                    putInt("total", total)
+                })
+                IndexingService.updateProgress(photoDone, photoTotal, videoDone, videoTotal)
+            },
+        )
+    }
+    private val store get() = indexer.store
+    private val embedDim get() = indexer.embedDim
+
+    // --- Foreground service (keeps a large pass running through screen-off) ---
+    // Backlogs at or under this size finish quickly enough that the in-process
+    // executor survives without foreground priority; only a real bulk index
+    // pays the notification's attention cost.
+    private val foregroundServiceThreshold = 50
+    @Volatile private var photoDone = 0
+    @Volatile private var photoTotal = 0
+    @Volatile private var videoDone = 0
+    @Volatile private var videoTotal = 0
+    @Volatile private var activeForegroundPasses = 0
+    private val foregroundServiceLock = Any()
+
+    /** Returns true if this pass registered itself with the foreground service. */
+    private fun maybeStartForegroundService(backlog: Int): Boolean {
+        if (backlog <= foregroundServiceThreshold) return false
+        synchronized(foregroundServiceLock) {
+            if (activeForegroundPasses == 0) {
+                IndexingService.onCancelRequested = { indexer.bumpScopeGeneration() }
+                IndexingService.start(reactContext)
+            }
+            activeForegroundPasses++
+        }
+        return true
+    }
+
+    private fun endForegroundPass(startedForeground: Boolean) {
+        if (!startedForeground) return
+        synchronized(foregroundServiceLock) {
+            activeForegroundPasses--
+            if (activeForegroundPasses <= 0) {
+                activeForegroundPasses = 0
+                IndexingService.stop(reactContext)
+            }
+        }
+    }
+
+    // Search-only prefs (match threshold, result count, recent queries) — indexing
+    // prefs (throttle/scope) live on SiftIndexer, which owns that SharedPreferences
+    // file jointly with this (same "sift_settings" file, safe to read/write from both).
     private val prefs by lazy {
         reactContext.getSharedPreferences("sift_settings", Context.MODE_PRIVATE)
     }
 
-    @Volatile
-    private var throttleMs: Long = -1
-
-    private fun deviceDefaultThrottleMs(): Long {
-        val am = reactContext.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        val mi = ActivityManager.MemoryInfo()
-        am.getMemoryInfo(mi)
-        val gb = mi.totalMem / (1024.0 * 1024 * 1024)
-        return when {
-            gb < 4.0 -> 250L // low-end (e.g. Galaxy F22): coolest
-            gb < 6.0 -> 120L // mid
-            else -> 50L // high-end: fast
-        }
-    }
-
-    private fun currentThrottleMs(): Long {
-        if (throttleMs < 0) {
-            throttleMs = prefs.getLong("throttle_ms", deviceDefaultThrottleMs())
-        }
-        return throttleMs
-    }
-
-    // --- Index scope (how far back to index, and whether to index videos) ----
-
-    private fun indexSinceMs(): Long = prefs.getLong("index_since_ms", 0L) // 0 = all time
-    private fun indexMaxFiles(): Int = prefs.getInt("index_max_files", 0) // 0 = no limit
-    private fun indexVideosEnabled(): Boolean = prefs.getBoolean("index_videos", true)
-
-    // --- Search tuning (match threshold, result count) ------------------------
-
     private fun matchMinPercent(): Int = prefs.getInt("match_min_percent", 60)
     private fun topK(): Int = prefs.getInt("top_k", 5)
-
-    // Bumped by setIndexScope. An indexGallery/indexVideos pass already running under
-    // the old scope checks this and aborts early instead of running to completion with
-    // a stale (often larger) cap — otherwise a scope change while indexing is in
-    // progress gets silently ignored until the stale pass finishes on its own.
-    @Volatile
-    private var scopeGeneration: Long = 0L
-
-    /** Cutoff for DATE_MODIFIED (seconds since epoch); 0 means no lower bound. */
-    private fun cutoffSeconds(): Long {
-        val since = indexSinceMs()
-        return if (since > 0) since / 1000 else 0
-    }
-
-    /** MediaStore selection + args for the current cutoff, or (null,null) for all. */
-    private fun dateSelection(dateCol: String): Pair<String?, Array<String>?> {
-        val cutoff = cutoffSeconds()
-        return if (cutoff > 0) "$dateCol >= ?" to arrayOf(cutoff.toString())
-        else null to null
-    }
 
     private fun interpreterOptions() = Interpreter.Options().apply {
         // Multi-threaded XNNPACK CPU inference — the Helio G80 has 8 cores and no
         // NPU, so threads are the main acceleration lever.
         numThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
-    }
-
-    private val imageInterpreter: Interpreter by lazy {
-        Interpreter(loadAsset("image_encoder.tflite"), interpreterOptions())
     }
 
     private val textInterpreter: Interpreter by lazy {
@@ -181,100 +179,6 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    /** Decode the image at [uriString], resize shorter side to 256, center-crop 256x256. */
-    private fun decodeAndCrop(uriString: String): Bitmap {
-        val uri = Uri.parse(uriString)
-
-        // Pass 1: read dimensions only.
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        reactContext.contentResolver.openInputStream(uri).use { input ->
-            BitmapFactory.decodeStream(input, null, bounds)
-        }
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-            throw IllegalArgumentException("Could not decode image: $uriString")
-        }
-
-        // Pass 2: decode with inSampleSize so the shorter side stays >= 2*256.
-        // This box-filter downsample during decode approximates the antialiasing
-        // that torchvision's resize applies, keeping embeddings faithful to the
-        // Python reference (plain bilinear from a huge photo aliases badly).
-        val shortSide = minOf(bounds.outWidth, bounds.outHeight)
-        var sample = 1
-        while (shortSide / (sample * 2) >= imageSize * 2) sample *= 2
-        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-        val bitmap =
-            reactContext.contentResolver.openInputStream(uri).use { input ->
-                BitmapFactory.decodeStream(input, null, opts)
-                    ?: throw IllegalArgumentException("Could not decode image: $uriString")
-            }
-
-        return resizeCrop(bitmap)
-    }
-
-    /** Resize shorter side to 256, center-crop 256x256. */
-    private fun resizeCrop(bitmap: Bitmap): Bitmap {
-        val w = bitmap.width
-        val h = bitmap.height
-        val scale = imageSize.toFloat() / minOf(w, h)
-        val scaledW = Math.round(w * scale)
-        val scaledH = Math.round(h * scale)
-        val scaled = Bitmap.createScaledBitmap(bitmap, scaledW, scaledH, true)
-        val x = (scaledW - imageSize) / 2
-        val y = (scaledH - imageSize) / 2
-        return Bitmap.createBitmap(scaled, x, y, imageSize, imageSize)
-    }
-
-    /** Fill a direct float32 buffer in NCHW order with pixels scaled to [0,1]. */
-    private fun toInputBuffer(bitmap: Bitmap): ByteBuffer {
-        val buffer =
-            ByteBuffer.allocateDirect(3 * imageSize * imageSize * 4)
-                .order(ByteOrder.nativeOrder())
-        val pixels = IntArray(imageSize * imageSize)
-        bitmap.getPixels(pixels, 0, imageSize, 0, 0, imageSize, imageSize)
-        // NCHW: write the full R plane, then G, then B.
-        for (channel in 0 until 3) {
-            val shift = when (channel) {
-                0 -> 16 // R
-                1 -> 8 // G
-                else -> 0 // B
-            }
-            for (p in pixels) {
-                buffer.putFloat(((p shr shift) and 0xFF) / 255f)
-            }
-        }
-        buffer.rewind()
-        return buffer
-    }
-
-    /** Preprocess a bitmap (already-decoded frame) and run the image encoder. */
-    private fun embedBitmap(bitmap: Bitmap): FloatArray {
-        val input = toInputBuffer(resizeCrop(bitmap))
-        val output = Array(1) { FloatArray(embedDim) }
-        synchronized(interpreterLock) { imageInterpreter.run(input, output) }
-        return output[0]
-    }
-
-    /** Decode -> preprocess -> run the image encoder, returning the 512-d embedding. */
-    private fun embedUri(uriString: String): FloatArray {
-        val input = toInputBuffer(decodeAndCrop(uriString))
-        val output = Array(1) { FloatArray(embedDim) }
-        synchronized(interpreterLock) { imageInterpreter.run(input, output) }
-        return output[0]
-    }
-
-    /** L2-normalize then quantize to int8 (512 bytes) for compact storage. */
-    private fun quantizeForStorage(embedding: FloatArray): ByteArray {
-        var norm = 0f
-        for (v in embedding) norm += v * v
-        norm = sqrt(norm).coerceAtLeast(1e-9f)
-        val bytes = ByteArray(embedding.size)
-        for (i in embedding.indices) {
-            val q = (embedding[i] / norm * 127f).roundToInt().coerceIn(-127, 127)
-            bytes[i] = q.toByte()
-        }
-        return bytes
-    }
-
     private fun emit(event: String, params: WritableMap) {
         reactContext
             .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
@@ -285,7 +189,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     fun embedImage(uriString: String, promise: Promise) {
         try {
             val result: WritableArray = Arguments.createArray()
-            for (v in embedUri(uriString)) result.pushDouble(v.toDouble())
+            for (v in indexer.embedUri(uriString)) result.pushDouble(v.toDouble())
             promise.resolve(result)
         } catch (e: Exception) {
             promise.reject("EMBED_IMAGE_ERROR", e.message, e)
@@ -301,87 +205,22 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
      */
     @ReactMethod
     fun indexGallery(maxCount: Int, promise: Promise) {
-        val myGeneration = scopeGeneration
         indexExecutor.execute {
-            // Background priority so foreground search preempts indexing on the CPU.
-            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+            var startedForeground = false
             try {
-                val indexed = store.indexedState()
-                val liveIds = HashSet<Long>()
-
-                data class Item(val id: Long, val dateModified: Long, val uri: String)
-                val toEmbed = ArrayList<Item>()
-
-                val projection = arrayOf(
-                    MediaStore.Images.Media._ID,
-                    MediaStore.Images.Media.DATE_MODIFIED,
-                )
-                val (sel, selArgs) = dateSelection(MediaStore.Images.Media.DATE_MODIFIED)
-                reactContext.contentResolver.query(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    projection,
-                    sel, selArgs,
-                    "${MediaStore.Images.Media.DATE_MODIFIED} DESC",
-                )?.use { c ->
-                    val idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-                    val dmCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
-                    val cap = indexMaxFiles() // 0 = no limit; rows are DESC by date
-                    while (c.moveToNext()) {
-                        if (myGeneration != scopeGeneration) break // scope changed mid-scan
-                        if (cap > 0 && liveIds.size >= cap) break
-                        val id = c.getLong(idCol)
-                        val dm = c.getLong(dmCol)
-                        liveIds.add(id)
-                        if (indexed[id] != dm) {
-                            val uri = ContentUris.withAppendedId(
-                                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id
-                            )
-                            toEmbed.add(Item(id, dm, uri.toString()))
-                            if (maxCount > 0 && toEmbed.size >= maxCount) break
-                        }
-                    }
+                val result = indexer.indexGalleryOnce(maxCount) { backlog ->
+                    startedForeground = maybeStartForegroundService(backlog)
                 }
-
-                // A newer scope has since superseded this pass — bail out without
-                // pruning/embedding against what's now a stale (often larger) scope.
-                // The follow-up call the scope change triggers picks up cleanly.
-                if (myGeneration != scopeGeneration) {
-                    promise.resolve(Arguments.createMap().apply {
-                        putInt("added", 0)
-                        putInt("removed", 0)
-                        putInt("totalIndexed", store.count())
-                    })
-                    return@execute
-                }
-
-                val removed = store.pruneNotIn(liveIds)
-                val total = toEmbed.size
-                var done = 0
-                for (item in toEmbed) {
-                    if (myGeneration != scopeGeneration) break // scope changed mid-embed
-                    try {
-                        val emb = embedUri(item.uri)
-                        store.upsert(item.id, item.dateModified, quantizeForStorage(emb))
-                    } catch (e: Exception) {
-                        // Skip unreadable images rather than aborting the whole index.
-                    }
-                    Thread.sleep(currentThrottleMs()) // thermal throttle
-                    done++
-                    if (done % 10 == 0 || done == total) {
-                        emit("SiftIndexProgress", Arguments.createMap().apply {
-                            putInt("done", done)
-                            putInt("total", total)
-                        })
-                    }
-                }
-
                 promise.resolve(Arguments.createMap().apply {
-                    putInt("added", done)
-                    putInt("removed", removed)
-                    putInt("totalIndexed", store.count())
+                    putInt("added", result.added)
+                    putInt("removed", result.removed)
+                    putInt("failed", result.failed)
+                    putInt("totalIndexed", result.totalIndexed)
                 })
             } catch (e: Exception) {
                 promise.reject("INDEX_ERROR", e.message, e)
+            } finally {
+                endForegroundPass(startedForeground)
             }
         }
     }
@@ -564,6 +403,14 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
             pool.filter { it.isVideo }.map { it.id },
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
         )
+        // Deleted-elsewhere hits are stale rows — drop them from the store now
+        // rather than waiting for the next full index pass to prune them.
+        for (h in pool) {
+            val stillLive = if (h.isVideo) h.id in liveVideoIds else h.id in livePhotoIds
+            if (!stillLive) {
+                if (h.isVideo) store.removeVideo(h.id) else store.removePhoto(h.id)
+            }
+        }
         val top = pool.filter { h ->
             if (h.isVideo) h.id in liveVideoIds else h.id in livePhotoIds
         }.take(topK)
@@ -733,11 +580,11 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
 
     /** In-scope count for [uri]: date-range filtered, then capped at max files. */
     private fun mediaStoreCount(uri: Uri, dateCol: String): Int {
-        val (sel, selArgs) = dateSelection(dateCol)
+        val (sel, selArgs) = indexer.dateSelection(dateCol)
         reactContext.contentResolver.query(
             uri, arrayOf(MediaStore.MediaColumns._ID), sel, selArgs, null,
         )?.use {
-            val cap = indexMaxFiles()
+            val cap = indexer.indexMaxFiles()
             return if (cap > 0) minOf(it.count, cap) else it.count
         }
         return 0
@@ -748,7 +595,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     fun libraryStats(promise: Promise) {
         searchExecutor.execute {
             try {
-                val videosOn = indexVideosEnabled()
+                val videosOn = indexer.indexVideosEnabled()
                 promise.resolve(Arguments.createMap().apply {
                     putInt("photosIndexed", store.count())
                     putInt(
@@ -779,11 +626,11 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     fun getSettings(promise: Promise) {
         try {
             promise.resolve(Arguments.createMap().apply {
-                putInt("throttleMs", currentThrottleMs().toInt())
-                putInt("deviceDefaultMs", deviceDefaultThrottleMs().toInt())
-                putDouble("indexSinceMs", indexSinceMs().toDouble())
-                putInt("indexMaxFiles", indexMaxFiles())
-                putBoolean("indexVideos", indexVideosEnabled())
+                putInt("throttleMs", indexer.currentThrottleMs().toInt())
+                putInt("deviceDefaultMs", indexer.deviceDefaultThrottleMs().toInt())
+                putDouble("indexSinceMs", indexer.indexSinceMs().toDouble())
+                putInt("indexMaxFiles", indexer.indexMaxFiles())
+                putBoolean("indexVideos", indexer.indexVideosEnabled())
                 putInt("matchMinPercent", matchMinPercent())
                 putInt("topK", topK())
             })
@@ -796,8 +643,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun setIndexThrottle(ms: Double, promise: Promise) {
         try {
-            throttleMs = ms.toLong().coerceIn(0L, 2000L)
-            prefs.edit().putLong("throttle_ms", throttleMs).apply()
+            indexer.setThrottleMs(ms.toLong().coerceIn(0L, 2000L))
             promise.resolve(null)
         } catch (e: Exception) {
             promise.reject("SETTINGS_ERROR", e.message, e)
@@ -838,7 +684,7 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                 .putInt("index_max_files", maxFiles.toInt())
                 .putBoolean("index_videos", indexVideos)
                 .apply()
-            scopeGeneration++
+            indexer.bumpScopeGeneration()
             promise.resolve(null)
         } catch (e: Exception) {
             promise.reject("SETTINGS_ERROR", e.message, e)
@@ -867,183 +713,73 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // --- Video keyframing ----------------------------------------------------
+    private val recentQueriesKey = "recent_queries"
+    private val maxRecentQueries = 10
 
-    private val descSide = 16 // cheap descriptor is a 16x16 grayscale
-    private val preFilterThreshold = 6f // mean abs grayscale diff below this = "no change"
-    private val keyframeMaxCosine = 0.90f // store only if < this similar to last keyframe
-    private val candidateIntervalMs = 2000L
-    private val maxCandidatesPerVideo = 40
-
-    /** Tiny grayscale descriptor for the cheap pre-filter (avoids embedding static frames). */
-    private fun cheapDescriptor(bitmap: Bitmap): FloatArray {
-        val small = Bitmap.createScaledBitmap(bitmap, descSide, descSide, true)
-        val px = IntArray(descSide * descSide)
-        small.getPixels(px, 0, descSide, 0, 0, descSide, descSide)
-        return FloatArray(px.size) { i ->
-            val p = px[i]
-            0.299f * ((p shr 16) and 0xFF) +
-                0.587f * ((p shr 8) and 0xFF) +
-                0.114f * (p and 0xFF)
-        }
-    }
-
-    private fun descriptorDiff(a: FloatArray, b: FloatArray): Float {
-        var sum = 0f
-        for (i in a.indices) sum += kotlin.math.abs(a[i] - b[i])
-        return sum / a.size
-    }
-
-    private fun cosine(a: FloatArray, b: FloatArray): Float {
-        var dot = 0f
-        var na = 0f
-        var nb = 0f
-        for (i in a.indices) {
-            dot += a[i] * b[i]
-            na += a[i] * a[i]
-            nb += b[i] * b[i]
-        }
-        return dot / (sqrt(na) * sqrt(nb) + 1e-9f)
-    }
-
-    /**
-     * Adaptive keyframing with a cheap pre-filter. Walks candidate frames; skips
-     * embedding ones visually near-identical to the last embedded frame (cheap
-     * grayscale diff); of the rest, stores a keyframe only when its embedding is
-     * sufficiently different from the last stored keyframe (real scene change).
-     */
-    private fun keyframeVideo(uri: String, durationMs: Long): List<Pair<Long, ByteArray>> {
-        val retriever = MediaMetadataRetriever()
-        val keyframes = ArrayList<Pair<Long, ByteArray>>()
+    /** Last successful search queries, most recent first. */
+    @ReactMethod
+    fun getRecentQueries(promise: Promise) {
         try {
-            retriever.setDataSource(reactContext, Uri.parse(uri))
-            val interval = maxOf(candidateIntervalMs, durationMs / maxCandidatesPerVideo)
-            var lastEmbeddedDesc: FloatArray? = null
-            var lastStoredEmb: FloatArray? = null
-
-            var t = 0L
-            while (t <= durationMs) {
-                val frame = retriever.getScaledFrameAtTime(
-                    t * 1000, // us
-                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-                    512, 512,
-                )
-                if (frame != null) {
-                    val desc = cheapDescriptor(frame)
-                    val stale = lastEmbeddedDesc?.let {
-                        descriptorDiff(desc, it) < preFilterThreshold
-                    } ?: false
-                    if (!stale) {
-                        lastEmbeddedDesc = desc
-                        val emb = embedBitmap(frame)
-                        val prev = lastStoredEmb
-                        if (prev == null || cosine(emb, prev) < keyframeMaxCosine) {
-                            keyframes.add(t to quantizeForStorage(emb))
-                            lastStoredEmb = emb
-                        }
-                        Thread.sleep(currentThrottleMs()) // thermal throttle
-                    }
-                }
-                t += interval
+            val result: WritableArray = Arguments.createArray()
+            val raw = prefs.getString(recentQueriesKey, null)
+            if (raw != null) {
+                val arr = JSONArray(raw)
+                for (i in 0 until arr.length()) result.pushString(arr.getString(i))
             }
-        } finally {
-            retriever.release()
+            promise.resolve(result)
+        } catch (e: Exception) {
+            promise.reject("SETTINGS_ERROR", e.message, e)
         }
-        return keyframes
+    }
+
+    /** Record a successful search query, deduped and capped at [maxRecentQueries]. */
+    @ReactMethod
+    fun addRecentQuery(query: String, promise: Promise) {
+        try {
+            val trimmed = query.trim()
+            if (trimmed.isEmpty()) {
+                promise.resolve(null)
+                return
+            }
+            val existing = ArrayList<String>()
+            val raw = prefs.getString(recentQueriesKey, null)
+            if (raw != null) {
+                val arr = JSONArray(raw)
+                for (i in 0 until arr.length()) existing.add(arr.getString(i))
+            }
+            existing.removeAll { it.equals(trimmed, ignoreCase = true) }
+            existing.add(0, trimmed)
+            while (existing.size > maxRecentQueries) existing.removeAt(existing.size - 1)
+
+            val out = JSONArray()
+            for (q in existing) out.put(q)
+            prefs.edit().putString(recentQueriesKey, out.toString()).apply()
+            promise.resolve(null)
+        } catch (e: Exception) {
+            promise.reject("SETTINGS_ERROR", e.message, e)
+        }
     }
 
     /** Incrementally keyframe gallery videos (new/changed only), prune deleted. */
     @ReactMethod
     fun indexVideos(maxCount: Int, promise: Promise) {
-        val myGeneration = scopeGeneration
         videoExecutor.execute {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+            var startedForeground = false
             try {
-                // Videos turned off in Settings: drop any existing keyframes and stop.
-                if (!indexVideosEnabled()) {
-                    val removed = store.pruneVideosNotIn(emptySet())
-                    promise.resolve(Arguments.createMap().apply {
-                        putInt("videosIndexed", 0)
-                        putInt("videosRemoved", removed)
-                        putInt("totalVideos", 0)
-                        putInt("totalKeyframes", 0)
-                    })
-                    return@execute
+                val result = indexer.indexVideosOnce(maxCount) { backlog ->
+                    startedForeground = maybeStartForegroundService(backlog)
                 }
-
-                val indexed = store.indexedVideoState()
-                val liveIds = HashSet<Long>()
-
-                data class Vid(val id: Long, val dm: Long, val dur: Long, val uri: String)
-                val toIndex = ArrayList<Vid>()
-
-                val projection = arrayOf(
-                    MediaStore.Video.Media._ID,
-                    MediaStore.Video.Media.DATE_MODIFIED,
-                    MediaStore.Video.Media.DURATION,
-                )
-                val (vsel, vselArgs) = dateSelection(MediaStore.Video.Media.DATE_MODIFIED)
-                reactContext.contentResolver.query(
-                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                    projection, vsel, vselArgs,
-                    "${MediaStore.Video.Media.DATE_MODIFIED} DESC",
-                )?.use { c ->
-                    val idCol = c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
-                    val dmCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_MODIFIED)
-                    val durCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
-                    val cap = indexMaxFiles() // 0 = no limit; rows are DESC by date
-                    while (c.moveToNext()) {
-                        if (myGeneration != scopeGeneration) break // scope changed mid-scan
-                        if (cap > 0 && liveIds.size >= cap) break
-                        val id = c.getLong(idCol)
-                        val dm = c.getLong(dmCol)
-                        liveIds.add(id)
-                        if (indexed[id] != dm) {
-                            val uri = ContentUris.withAppendedId(
-                                MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id
-                            )
-                            toIndex.add(Vid(id, dm, c.getLong(durCol), uri.toString()))
-                            if (maxCount > 0 && toIndex.size >= maxCount) break
-                        }
-                    }
-                }
-
-                if (myGeneration != scopeGeneration) {
-                    promise.resolve(Arguments.createMap().apply {
-                        putInt("videosIndexed", 0)
-                        putInt("videosRemoved", 0)
-                        putInt("totalVideos", store.videoCount())
-                        putInt("totalKeyframes", store.keyframeCount())
-                    })
-                    return@execute
-                }
-
-                val removed = store.pruneVideosNotIn(liveIds)
-                val total = toIndex.size
-                var done = 0
-                for (v in toIndex) {
-                    if (myGeneration != scopeGeneration) break // scope changed mid-embed
-                    try {
-                        val kfs = keyframeVideo(v.uri, v.dur)
-                        store.replaceVideoKeyframes(v.id, v.dm, kfs)
-                    } catch (e: Exception) {
-                        // Skip unreadable/corrupt videos.
-                    }
-                    done++
-                    emit("SiftVideoProgress", Arguments.createMap().apply {
-                        putInt("done", done)
-                        putInt("total", total)
-                    })
-                }
-
                 promise.resolve(Arguments.createMap().apply {
-                    putInt("videosIndexed", done)
-                    putInt("videosRemoved", removed)
-                    putInt("totalVideos", store.videoCount())
-                    putInt("totalKeyframes", store.keyframeCount())
+                    putInt("videosIndexed", result.videosIndexed)
+                    putInt("videosRemoved", result.videosRemoved)
+                    putInt("videosFailed", result.videosFailed)
+                    putInt("totalVideos", result.totalVideos)
+                    putInt("totalKeyframes", result.totalKeyframes)
                 })
             } catch (e: Exception) {
                 promise.reject("VIDEO_INDEX_ERROR", e.message, e)
+            } finally {
+                endForegroundPass(startedForeground)
             }
         }
     }

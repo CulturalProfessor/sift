@@ -3,6 +3,7 @@ import { NativeEventEmitter, NativeModules } from 'react-native';
 export interface IndexResult {
   added: number;
   removed: number;
+  failed: number;
   totalIndexed: number;
 }
 
@@ -22,6 +23,7 @@ export interface SearchHit {
 export interface VideoIndexResult {
   videosIndexed: number;
   videosRemoved: number;
+  videosFailed: number;
   totalVideos: number;
   totalKeyframes: number;
 }
@@ -61,6 +63,8 @@ interface SiftEmbedderNative {
   ): Promise<void>;
   setMatchMin(percent: number): Promise<void>;
   setTopK(k: number): Promise<void>;
+  getRecentQueries(): Promise<string[]>;
+  addRecentQuery(query: string): Promise<void>;
   clearIndex(): Promise<void>;
   readAsset(name: string): Promise<string>;
   openVideoAt(uri: string, timestampMs: number): Promise<void>;
@@ -149,6 +153,14 @@ export function setMatchMin(percent: number): Promise<void> {
 
 export function setTopK(k: number): Promise<void> {
   return SiftEmbedder.setTopK(k);
+}
+
+export function getRecentQueries(): Promise<string[]> {
+  return SiftEmbedder.getRecentQueries();
+}
+
+export function addRecentQuery(query: string): Promise<void> {
+  return SiftEmbedder.addRecentQuery(query);
 }
 
 export function clearIndex(): Promise<void> {

@@ -16,7 +16,9 @@ import {
   View,
 } from 'react-native';
 import {
+  addRecentQuery,
   deleteAsset,
+  getRecentQueries,
   getSettings,
   indexGallery,
   indexVideos,
@@ -59,6 +61,9 @@ async function requestMediaPermission(): Promise<boolean> {
     const res = await PermissionsAndroid.requestMultiple([
       PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES,
       PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO,
+      // Optional: only gates the indexing-progress notification, not core
+      // functionality, so a decline here doesn't affect the return value.
+      PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS,
     ]);
     return (
       res[PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES] ===
@@ -91,6 +96,16 @@ function matchPercent(score: number): number {
       99,
       Math.round(((score - SCORE_FLOOR) / (SCORE_CEILING - SCORE_FLOOR)) * 100),
     ),
+  );
+}
+
+/** Thin determinate progress bar for "N / total" indexing counts. */
+function ProgressBar({ progress }: { progress: number }) {
+  const pct = Math.round(Math.max(0, Math.min(1, progress)) * 100);
+  return (
+    <View style={styles.progressTrack}>
+      <View style={[styles.progressFill, { width: `${pct}%` }]} />
+    </View>
   );
 }
 
@@ -128,10 +143,12 @@ function SkeletonGrid() {
 function EmptyState({
   stats,
   indexing,
+  failedCount,
   onPickExample,
 }: {
   stats: LibraryStats | null;
   indexing: boolean;
+  failedCount: number;
   onPickExample: (q: string) => void;
 }) {
   const enter = useRef(new Animated.Value(0)).current;
@@ -218,9 +235,15 @@ function EmptyState({
           <Text style={styles.indexStatusText}>
             {stats.photosIndexed.toLocaleString()} / {stats.photosTotal.toLocaleString()} photos
           </Text>
-          <Text style={styles.indexStatusText}>
+          {indexing && stats.photosTotal > 0 && (
+            <ProgressBar progress={stats.photosIndexed / stats.photosTotal} />
+          )}
+          <Text style={[styles.indexStatusText, styles.videoStatusText]}>
             {stats.videosIndexed.toLocaleString()} / {stats.videosTotal.toLocaleString()} videos
           </Text>
+          {indexing && stats.videosTotal > 0 && (
+            <ProgressBar progress={stats.videosIndexed / stats.videosTotal} />
+          )}
           {indexing && (
             <>
               <View style={styles.indexingRow}>
@@ -232,6 +255,11 @@ function EmptyState({
                 automatically. You can already search whatever is ready.
               </Text>
             </>
+          )}
+          {failedCount > 0 && (
+            <Text style={styles.indexFailedText}>
+              {failedCount} item{failedCount === 1 ? '' : 's'} couldn't be indexed
+            </Text>
           )}
         </View>
       )}
@@ -256,6 +284,10 @@ export function PhotoGridScreen() {
   const [topK, setTopK] = useState(DEFAULT_TOP_K);
   // Non-null while showing "find similar" results instead of a text search.
   const [similarTo, setSimilarTo] = useState<SearchHit | null>(null);
+  const [searchError, setSearchError] = useState(false);
+  const [recentQueries, setRecentQueries] = useState<string[]>([]);
+  const [searchFocused, setSearchFocused] = useState(false);
+  const [failedCount, setFailedCount] = useState(0);
 
   useEffect(() => {
     requestMediaPermission().then(granted =>
@@ -269,8 +301,18 @@ export function PhotoGridScreen() {
         setMatchMin(s.matchMinPercent);
         setTopK(s.topK);
       })
-      .catch(() => {});
+      .catch(e => console.log('getSettings failed', e));
   }, []);
+
+  const refreshRecentQueries = useCallback(() => {
+    getRecentQueries()
+      .then(setRecentQueries)
+      .catch(e => console.log('getRecentQueries failed', e));
+  }, []);
+
+  useEffect(() => {
+    refreshRecentQueries();
+  }, [refreshRecentQueries]);
 
   // Called by Settings when match % or result count changes, so search
   // behaves with the new values immediately rather than after a re-open.
@@ -280,7 +322,9 @@ export function PhotoGridScreen() {
   }, []);
 
   const refreshStats = useCallback(() => {
-    libraryStats().then(setStats).catch(() => {});
+    libraryStats()
+      .then(setStats)
+      .catch(e => console.log('libraryStats failed', e));
   }, []);
 
   const removeFromResults = useCallback((item: SearchHit) => {
@@ -334,7 +378,8 @@ export function PhotoGridScreen() {
     activePhotoIndexCalls.current++;
     setIndexingPhotos(true);
     try {
-      await indexGallery(0);
+      const result = await indexGallery(0);
+      if (result.failed > 0) setFailedCount(n => n + result.failed);
       refreshStats();
     } finally {
       activePhotoIndexCalls.current--;
@@ -347,7 +392,8 @@ export function PhotoGridScreen() {
     activeVideoIndexCalls.current++;
     setIndexingVideos(true);
     try {
-      await indexVideos(0);
+      const result = await indexVideos(0);
+      if (result.videosFailed > 0) setFailedCount(n => n + result.videosFailed);
       refreshStats();
     } finally {
       activeVideoIndexCalls.current--;
@@ -387,6 +433,7 @@ export function PhotoGridScreen() {
 
   // When the user changes what to index, re-run so it prunes/adds to match.
   const onScopeChanged = useCallback(() => {
+    setFailedCount(0);
     refreshStats();
     runFullIndex();
   }, [refreshStats, runFullIndex]);
@@ -401,15 +448,25 @@ export function PhotoGridScreen() {
     }
     const seq = ++searchSeq.current;
     setSearching(true);
+    setSearchError(false);
     try {
       const hits = await searchByText(q, topK);
-      if (seq === searchSeq.current) setResults(hits);
+      if (seq === searchSeq.current) {
+        setResults(hits);
+        addRecentQuery(q)
+          .then(refreshRecentQueries)
+          .catch(e => console.log('addRecentQuery failed', e));
+      }
     } catch (e) {
       console.log('search error', e);
+      if (seq === searchSeq.current) {
+        setResults(null);
+        setSearchError(true);
+      }
     } finally {
       if (seq === searchSeq.current) setSearching(false);
     }
-  }, [topK]);
+  }, [topK, refreshRecentQueries]);
 
   useEffect(() => {
     if (query.trim() === '') {
@@ -422,6 +479,7 @@ export function PhotoGridScreen() {
         searchSeq.current++;
         setResults(null);
         setSearching(false);
+        setSearchError(false);
       }
       return;
     }
@@ -442,6 +500,7 @@ export function PhotoGridScreen() {
     setQuery('');
     setResults(null);
     setSimilarTo(null);
+    setSearchError(false);
   }, []);
 
   // "Find similar": no text query involved, so it bypasses runSearch/searchByText
@@ -452,11 +511,16 @@ export function PhotoGridScreen() {
       setQuery('');
       setSimilarTo(item);
       setSearching(true);
+      setSearchError(false);
       try {
         const hits = await searchByAsset(item.assetId, item.isVideo, topK);
         if (seq === searchSeq.current) setResults(hits);
       } catch (e) {
         console.log('find similar error', e);
+        if (seq === searchSeq.current) {
+          setResults(null);
+          setSearchError(true);
+        }
       } finally {
         if (seq === searchSeq.current) setSearching(false);
       }
@@ -464,10 +528,22 @@ export function PhotoGridScreen() {
     [topK],
   );
 
+  const retrySearch = useCallback(() => {
+    if (similarTo) searchSimilar(similarTo);
+    else runSearch(query);
+  }, [similarTo, searchSimilar, runSearch, query]);
+
   // Only treat results as "showable" once a text query or a "find similar"
   // is active — guards against a stale in-flight search landing after the
   // query was cleared.
   const hasResults = (query.trim() !== '' || similarTo !== null) && results !== null;
+  const showRecentQueries =
+    searchFocused &&
+    !searching &&
+    !searchError &&
+    query.trim() === '' &&
+    similarTo === null &&
+    recentQueries.length > 0;
   // Only surface confident matches.
   const shownResults = (results ?? []).filter(
     r => matchPercent(r.score) >= matchMin,
@@ -501,22 +577,45 @@ export function PhotoGridScreen() {
           value={query}
           onChangeText={setQuery}
           onSubmitEditing={() => runSearch(query)}
+          onFocus={() => setSearchFocused(true)}
+          onBlur={() => setSearchFocused(false)}
           returnKeyType="search"
           autoCapitalize="none"
         />
         {query !== '' || similarTo !== null ? (
-          <Pressable style={styles.iconButton} onPress={clearSearch}>
+          <Pressable
+            style={styles.iconButton}
+            onPress={clearSearch}
+            accessibilityLabel="Clear search"
+            accessibilityRole="button"
+          >
             <Text style={styles.iconButtonText}>✕</Text>
           </Pressable>
         ) : (
           <Pressable
             style={styles.iconButton}
             onPress={() => setSettingsVisible(true)}
+            accessibilityLabel="Settings"
+            accessibilityRole="button"
           >
             <Text style={styles.iconButtonText}>⚙</Text>
           </Pressable>
         )}
       </View>
+
+      {showRecentQueries && (
+        <View style={styles.chips}>
+          {recentQueries.map(q => (
+            <Pressable
+              key={q}
+              onPress={() => pickExample(q)}
+              style={styles.chip}
+            >
+              <Text style={styles.chipText}>{q}</Text>
+            </Pressable>
+          ))}
+        </View>
+      )}
 
       {hasResults && !searching && shownResults.length > 0 && (
         <Text style={styles.resultCount}>
@@ -528,10 +627,15 @@ export function PhotoGridScreen() {
 
       {searching ? (
         <SkeletonGrid />
+      ) : searchError ? (
+        <Pressable style={styles.errorState} onPress={retrySearch}>
+          <Text style={styles.errorText}>Search failed — tap to retry</Text>
+        </Pressable>
       ) : !hasResults ? (
         <EmptyState
           stats={stats}
           indexing={indexing}
+          failedCount={failedCount}
           onPickExample={pickExample}
         />
       ) : shownResults.length === 0 ? (
@@ -783,6 +887,20 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 18,
   },
+  videoStatusText: { marginTop: 6 },
+  progressTrack: {
+    width: 200,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: '#262626',
+    marginTop: 4,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    borderRadius: 2,
+    backgroundColor: '#3b82f6',
+  },
   indexingRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -797,6 +915,12 @@ const styles = StyleSheet.create({
     lineHeight: 17,
     marginTop: 8,
     maxWidth: 300,
+  },
+  indexFailedText: {
+    color: '#f59e0b',
+    fontSize: 11.5,
+    textAlign: 'center',
+    marginTop: 10,
   },
   pulseDot: {
     width: 8,
@@ -845,4 +969,12 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 8,
   },
+  errorState: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 32,
+    paddingBottom: 80,
+  },
+  errorText: { color: '#f87171', fontSize: 15, textAlign: 'center' },
 });

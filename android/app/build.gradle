@@ -132,6 +132,12 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer:1.10.1")
     implementation("androidx.media3:media3-ui:1.10.1")
 
+    // Periodic background catch-up indexing (survives the app being closed) —
+    // WorkManager is the supported way to get opportunistic background execution
+    // on modern Android; plain background threads get frozen once the app isn't
+    // foregrounded.
+    implementation("androidx.work:work-runtime-ktx:2.10.0")
+
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
     } else {
