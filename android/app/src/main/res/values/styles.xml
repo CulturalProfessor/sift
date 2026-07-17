@@ -4,6 +4,21 @@
     <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
         <!-- Customize your theme here. -->
         <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
+        <!-- Pre-first-frame background (API < 31, and the moment between the
+             API 31+ splash dismissing and RN's first frame painting). Without
+             this it defaults to AppCompat.DayNight's light background, which
+             is the "gray screen" seen before the app's actual dark UI. -->
+        <item name="android:windowBackground">@color/app_background</item>
+        <!-- API 31+ system splash screen (Android auto-generates one from the
+             launcher icon otherwise, with a light default background — this
+             is what made it look like two different startup screens). The
+             icon itself is intentionally blank: the launcher icon is a large
+             wordmark, and the SplashScreen API renders it stretched/blurry at
+             icon size, which read as a second, lower-fidelity "Sift" screen
+             right before the real in-app wordmark paints. Blank icon + matching
+             background means "Sift" only appears once, in the app's own UI. -->
+        <item name="android:windowSplashScreenBackground">@color/app_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon_blank</item>
     </style>
 
 </resources>

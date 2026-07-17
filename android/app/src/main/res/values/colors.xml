@@ -1,0 +1,6 @@
+<resources>
+    <!-- Matches PhotoGridScreen's container background so the system splash
+         screen (API 31+) and the app's first rendered frame read as one
+         continuous screen instead of a gray-then-black flash. -->
+    <color name="app_background">#0a0a0a</color>
+</resources>

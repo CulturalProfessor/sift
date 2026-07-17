@@ -4,10 +4,17 @@ import android.app.Activity
 import android.app.RecoverableSecurityException
 import android.content.ContentUris
 import android.content.Context
+import android.content.Intent
 import android.content.IntentSender
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import com.facebook.react.bridge.ActivityEventListener
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -757,6 +764,97 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(null)
         } catch (e: Exception) {
             promise.reject("SETTINGS_ERROR", e.message, e)
+        }
+    }
+
+    // --- Voice search -----------------------------------------------------
+    // SpeechRecognizer must be created/driven from the main thread; ReactMethod
+    // calls land on a native-modules thread, so everything below is posted to
+    // the main Looper.
+
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+    private var activeRecognizer: SpeechRecognizer? = null
+    private var activeVoicePromise: Promise? = null
+
+    /** Whether on-device speech recognition is available at all, so the JS side can hide the mic. */
+    @ReactMethod
+    fun isVoiceSearchAvailable(promise: Promise) {
+        promise.resolve(SpeechRecognizer.isRecognitionAvailable(reactContext))
+    }
+
+    /** Listen once and resolve with the recognized text (empty string if nothing matched). */
+    @ReactMethod
+    fun startVoiceSearch(promise: Promise) {
+        mainHandler.post {
+            try {
+                if (!SpeechRecognizer.isRecognitionAvailable(reactContext)) {
+                    promise.reject("VOICE_UNAVAILABLE", "Speech recognition not available")
+                    return@post
+                }
+                activeRecognizer?.destroy()
+                val recognizer = SpeechRecognizer.createSpeechRecognizer(reactContext)
+                activeRecognizer = recognizer
+                activeVoicePromise = promise
+
+                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                    putExtra(
+                        RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                        RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
+                    )
+                    // Offline-preferred keeps this working airplane-mode/no-signal, matching
+                    // the rest of the app's fully-offline design; falls back to online
+                    // recognition transparently if no offline model is installed.
+                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                }
+
+                var settled = false
+                fun settle(block: () -> Unit) {
+                    if (settled) return
+                    settled = true
+                    block()
+                    recognizer.destroy()
+                    if (activeRecognizer === recognizer) activeRecognizer = null
+                    if (activeVoicePromise === promise) activeVoicePromise = null
+                }
+
+                recognizer.setRecognitionListener(object : RecognitionListener {
+                    override fun onResults(results: Bundle) {
+                        settle {
+                            val matches =
+                                results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            promise.resolve(matches?.firstOrNull() ?: "")
+                        }
+                    }
+                    override fun onError(error: Int) {
+                        settle { promise.reject("VOICE_ERROR", "Speech recognition error: $error") }
+                    }
+                    override fun onReadyForSpeech(params: Bundle?) {}
+                    override fun onBeginningOfSpeech() {}
+                    override fun onRmsChanged(rmsdB: Float) {}
+                    override fun onBufferReceived(buffer: ByteArray?) {}
+                    override fun onEndOfSpeech() {}
+                    override fun onPartialResults(partialResults: Bundle?) {}
+                    override fun onEvent(eventType: Int, params: Bundle?) {}
+                })
+                recognizer.startListening(intent)
+            } catch (e: Exception) {
+                promise.reject("VOICE_ERROR", e.message, e)
+            }
+        }
+    }
+
+    /** Stop listening without resolving a result (user backed out of the mic UI). */
+    @ReactMethod
+    fun cancelVoiceSearch(promise: Promise) {
+        mainHandler.post {
+            activeRecognizer?.cancel()
+            activeRecognizer?.destroy()
+            activeRecognizer = null
+            // Settle the original startVoiceSearch call too, or its promise hangs forever.
+            activeVoicePromise?.resolve("")
+            activeVoicePromise = null
+            promise.resolve(null)
         }
     }
 

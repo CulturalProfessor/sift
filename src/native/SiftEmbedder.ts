@@ -70,6 +70,9 @@ interface SiftEmbedderNative {
   openVideoAt(uri: string, timestampMs: number): Promise<void>;
   openInGallery(uri: string, isVideo: boolean): Promise<void>;
   deleteAsset(uri: string, isVideo: boolean): Promise<boolean>;
+  isVoiceSearchAvailable(): Promise<boolean>;
+  startVoiceSearch(): Promise<string>;
+  cancelVoiceSearch(): Promise<void>;
 }
 
 export interface IndexSettings {
@@ -186,6 +189,19 @@ export function openInGallery(uri: string, isVideo: boolean): Promise<void> {
 /** Resolves true if deleted, false if the user declined the system confirmation. */
 export function deleteAsset(uri: string, isVideo: boolean): Promise<boolean> {
   return SiftEmbedder.deleteAsset(uri, isVideo);
+}
+
+export function isVoiceSearchAvailable(): Promise<boolean> {
+  return SiftEmbedder.isVoiceSearchAvailable();
+}
+
+/** Listens once and resolves with the recognized text ('' if nothing matched). */
+export function startVoiceSearch(): Promise<string> {
+  return SiftEmbedder.startVoiceSearch();
+}
+
+export function cancelVoiceSearch(): Promise<void> {
+  return SiftEmbedder.cancelVoiceSearch();
 }
 
 export function onIndexProgress(cb: (p: IndexProgress) => void): () => void {

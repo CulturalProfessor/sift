@@ -17,17 +17,20 @@ import {
 } from 'react-native';
 import {
   addRecentQuery,
+  cancelVoiceSearch,
   deleteAsset,
   getRecentQueries,
   getSettings,
   indexGallery,
   indexVideos,
+  isVoiceSearchAvailable,
   libraryStats,
   onIndexProgress,
   onVideoProgress,
   openInGallery,
   openVideoAt,
   searchByAsset,
+  startVoiceSearch,
   type LibraryStats,
   type SearchHit,
 } from '../native/SiftEmbedder';
@@ -72,6 +75,16 @@ async function requestMediaPermission(): Promise<boolean> {
   }
   const result = await PermissionsAndroid.request(
     PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE,
+  );
+  return result === PermissionsAndroid.RESULTS.GRANTED;
+}
+
+// Requested on-demand (first mic tap) rather than at startup, since voice
+// search is optional and most users will never touch it.
+async function requestMicPermission(): Promise<boolean> {
+  if (Platform.OS !== 'android') return false;
+  const result = await PermissionsAndroid.request(
+    PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
   );
   return result === PermissionsAndroid.RESULTS.GRANTED;
 }
@@ -123,6 +136,18 @@ function PulseDot() {
     return () => loop.stop();
   }, [v]);
   return <Animated.View style={[styles.pulseDot, { opacity: v }]} />;
+}
+
+/** Small flat mic glyph, built from plain Views to match the app's monochrome icon style. */
+function MicIcon({ color }: { color: string }) {
+  return (
+    <View style={styles.micIcon}>
+      <View style={[styles.micBody, { backgroundColor: color }]} />
+      <View style={[styles.micStand, { borderColor: color }]} />
+      <View style={[styles.micStem, { backgroundColor: color }]} />
+      <View style={[styles.micBase, { backgroundColor: color }]} />
+    </View>
+  );
 }
 
 // Enough rows to fill the screen while a search runs.
@@ -288,11 +313,19 @@ export function PhotoGridScreen() {
   const [recentQueries, setRecentQueries] = useState<string[]>([]);
   const [searchFocused, setSearchFocused] = useState(false);
   const [failedCount, setFailedCount] = useState(0);
+  const [voiceAvailable, setVoiceAvailable] = useState(false);
+  const [listening, setListening] = useState(false);
 
   useEffect(() => {
     requestMediaPermission().then(granted =>
       setPermissionState(granted ? 'granted' : 'denied'),
     );
+  }, []);
+
+  useEffect(() => {
+    isVoiceSearchAvailable()
+      .then(setVoiceAvailable)
+      .catch(() => setVoiceAvailable(false));
   }, []);
 
   useEffect(() => {
@@ -468,6 +501,31 @@ export function PhotoGridScreen() {
     }
   }, [topK, refreshRecentQueries]);
 
+  const startListening = useCallback(async () => {
+    const granted = await requestMicPermission();
+    if (!granted) {
+      Alert.alert('Microphone access needed', 'Enable it in system settings to use voice search.');
+      return;
+    }
+    setListening(true);
+    try {
+      const text = await startVoiceSearch();
+      if (text.trim() !== '') {
+        setQuery(text);
+        runSearch(text);
+      }
+    } catch (e) {
+      console.log('voice search error', e);
+    } finally {
+      setListening(false);
+    }
+  }, [runSearch]);
+
+  const stopListening = useCallback(() => {
+    cancelVoiceSearch().catch(e => console.log('cancelVoiceSearch failed', e));
+    setListening(false);
+  }, []);
+
   useEffect(() => {
     if (query.trim() === '') {
       // A "find similar" run also clears the query (to swap out of text-search
@@ -582,6 +640,20 @@ export function PhotoGridScreen() {
           returnKeyType="search"
           autoCapitalize="none"
         />
+        {voiceAvailable && (
+          <Pressable
+            style={[styles.iconButton, listening && styles.iconButtonActive]}
+            onPress={listening ? stopListening : startListening}
+            accessibilityLabel={listening ? 'Stop listening' : 'Voice search'}
+            accessibilityRole="button"
+          >
+            {listening ? (
+              <View style={styles.stopIcon} />
+            ) : (
+              <MicIcon color="#9ca3af" />
+            )}
+          </Pressable>
+        )}
         {query !== '' || similarTo !== null ? (
           <Pressable
             style={styles.iconButton}
@@ -794,6 +866,42 @@ const styles = StyleSheet.create({
     borderColor: '#262626',
   },
   iconButtonText: { color: '#9ca3af', fontSize: 16 },
+  iconButtonActive: { backgroundColor: '#3b0d0d', borderColor: '#dc2626' },
+  micIcon: {
+    width: 16,
+    height: 18,
+    alignItems: 'center',
+  },
+  micBody: {
+    width: 7,
+    height: 9,
+    borderRadius: 3.5,
+  },
+  micStand: {
+    width: 12,
+    height: 6,
+    marginTop: -3,
+    borderWidth: 1.4,
+    borderTopColor: 'transparent',
+    borderBottomLeftRadius: 6,
+    borderBottomRightRadius: 6,
+  },
+  micStem: {
+    width: 1.4,
+    height: 3,
+  },
+  micBase: {
+    width: 7,
+    height: 1.4,
+    borderRadius: 1,
+    marginTop: 1,
+  },
+  stopIcon: {
+    width: 12,
+    height: 12,
+    borderRadius: 2,
+    backgroundColor: '#f87171',
+  },
 
   resultCount: {
     color: '#9ca3af',

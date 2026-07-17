@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Invisible splash "icon" — the app's launcher icon is a large wordmark, which
+     the SplashScreen API renders blurry/stretched at icon size, reading as a
+     second, lower-fidelity "Sift" screen right before the real (crisp) in-app
+     wordmark paints. Leaving the icon blank means the splash is just the plain
+     background color, and "Sift" only ever appears once, in the app's own UI. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <solid android:color="@android:color/transparent" />
+</shape>
