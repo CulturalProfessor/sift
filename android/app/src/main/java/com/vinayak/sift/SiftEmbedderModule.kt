@@ -454,74 +454,135 @@ class SiftEmbedderModule(private val reactContext: ReactApplicationContext) :
                 qn = sqrt(qn).coerceAtLeast(1e-9f)
                 for (i in q.indices) q[i] /= qn
 
-                data class Hit(
-                    val id: Long,
-                    val score: Float,
-                    val isVideo: Boolean,
-                    val timestampMs: Long,
-                )
-
-                // Photos.
-                val hits = ArrayList<Hit>()
-                for ((id, bytes) in store.all()) {
-                    if (myToken != latestSearchToken) {
-                        promise.resolve(Arguments.createArray())
-                        return@execute
-                    }
-                    hits.add(Hit(id, dotInt8(bytes, q), false, 0L))
-                }
-
-                // Video keyframes -> best moment per video.
-                val bestPerVideo = HashMap<Long, Hit>()
-                for (kf in store.allKeyframes()) {
-                    if (myToken != latestSearchToken) {
-                        promise.resolve(Arguments.createArray())
-                        return@execute
-                    }
-                    val s = dotInt8(kf.embedding, q)
-                    val cur = bestPerVideo[kf.videoId]
-                    if (cur == null || s > cur.score) {
-                        bestPerVideo[kf.videoId] = Hit(kf.videoId, s, true, kf.timestampMs)
-                    }
-                }
-                hits.addAll(bestPerVideo.values)
-
-                // Over-fetch, then drop hits whose file was deleted since the last full
-                // index (the index only prunes deletions on app open, not per-search) —
-                // check existence for just this candidate pool, not the whole library.
-                val sorted = hits.sortedByDescending { it.score }
-                val pool = sorted.take((topK * 3).coerceAtLeast(topK))
-                val livePhotoIds = existingIds(
-                    pool.filter { !it.isVideo }.map { it.id },
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                )
-                val liveVideoIds = existingIds(
-                    pool.filter { it.isVideo }.map { it.id },
-                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                )
-                val top = pool.filter { h ->
-                    if (h.isVideo) h.id in liveVideoIds else h.id in livePhotoIds
-                }.take(topK)
-
-                val result: WritableArray = Arguments.createArray()
-                for (h in top) {
-                    val base = if (h.isVideo)
-                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                    else
-                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-                    result.pushMap(Arguments.createMap().apply {
-                        putString("assetId", h.id.toString())
-                        putString("uri", ContentUris.withAppendedId(base, h.id).toString())
-                        putDouble("score", h.score.toDouble())
-                        putBoolean("isVideo", h.isVideo)
-                        putDouble("timestampMs", h.timestampMs.toDouble())
-                    })
-                }
-                promise.resolve(result)
+                promise.resolve(rankAndFilter(q, topK, excludeId = null, excludeIsVideo = false) {
+                    myToken == latestSearchToken
+                })
             } catch (e: Exception) {
                 promise.reject("SEARCH_ERROR", e.message, e)
             }
         }
+    }
+
+    /**
+     * "Find similar": reuse a stored asset's own embedding as the query — no
+     * inference needed, so this is effectively instant. Excludes the source
+     * asset itself from the results.
+     */
+    @ReactMethod
+    fun searchByAsset(assetId: Double, isVideo: Boolean, topK: Int, promise: Promise) {
+        searchExecutor.execute {
+            try {
+                val id = assetId.toLong()
+                val source: FloatArray = if (isVideo) {
+                    val keyframes = store.getVideoKeyframes(id)
+                    if (keyframes.isEmpty()) {
+                        promise.reject("NOT_INDEXED", "Video $id has no stored embedding")
+                        return@execute
+                    }
+                    val avg = FloatArray(embedDim)
+                    for (kf in keyframes) {
+                        for (i in 0 until embedDim) avg[i] += kf.embedding[i] / 127f
+                    }
+                    for (i in avg.indices) avg[i] /= keyframes.size
+                    avg
+                } else {
+                    val bytes = store.getPhotoEmbedding(id)
+                        ?: run {
+                            promise.reject("NOT_INDEXED", "Photo $id has no stored embedding")
+                            return@execute
+                        }
+                    FloatArray(embedDim) { bytes[it] / 127f }
+                }
+
+                var norm = 0f
+                for (v in source) norm += v * v
+                norm = sqrt(norm).coerceAtLeast(1e-9f)
+                for (i in source.indices) source[i] /= norm
+
+                promise.resolve(rankAndFilter(source, topK, excludeId = id, excludeIsVideo = isVideo) { true })
+            } catch (e: Exception) {
+                promise.reject("SEARCH_ERROR", e.message, e)
+            }
+        }
+    }
+
+    private data class Hit(
+        val id: Long,
+        val score: Float,
+        val isVideo: Boolean,
+        val timestampMs: Long,
+    )
+
+    /**
+     * Brute-force cosine search over photos AND video keyframes given an
+     * already-unit-normalized query [q]. Photos and keyframes share one
+     * embedding space, so a single query ranks both. Video hits are deduped
+     * to the best-scoring moment per video and carry its timestamp.
+     * [stillLive] is polled between passes so a superseded text search can
+     * bail out early; asset-similarity searches just pass `{ true }`.
+     */
+    private fun rankAndFilter(
+        q: FloatArray,
+        topK: Int,
+        excludeId: Long?,
+        excludeIsVideo: Boolean,
+        stillLive: () -> Boolean,
+    ): WritableArray {
+        if (!stillLive()) return Arguments.createArray()
+
+        // Photos.
+        val hits = ArrayList<Hit>()
+        for ((id, bytes) in store.all()) {
+            if (!excludeIsVideo && id == excludeId) continue
+            if (!stillLive()) return Arguments.createArray()
+            hits.add(Hit(id, dotInt8(bytes, q), false, 0L))
+        }
+
+        // Video keyframes -> best moment per video.
+        val bestPerVideo = HashMap<Long, Hit>()
+        for (kf in store.allKeyframes()) {
+            if (excludeIsVideo && kf.videoId == excludeId) continue
+            if (!stillLive()) return Arguments.createArray()
+            val s = dotInt8(kf.embedding, q)
+            val cur = bestPerVideo[kf.videoId]
+            if (cur == null || s > cur.score) {
+                bestPerVideo[kf.videoId] = Hit(kf.videoId, s, true, kf.timestampMs)
+            }
+        }
+        hits.addAll(bestPerVideo.values)
+
+        // Over-fetch, then drop hits whose file was deleted since the last full
+        // index (the index only prunes deletions on app open, not per-search) —
+        // check existence for just this candidate pool, not the whole library.
+        val sorted = hits.sortedByDescending { it.score }
+        val pool = sorted.take((topK * 3).coerceAtLeast(topK))
+        val livePhotoIds = existingIds(
+            pool.filter { !it.isVideo }.map { it.id },
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+        )
+        val liveVideoIds = existingIds(
+            pool.filter { it.isVideo }.map { it.id },
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+        )
+        val top = pool.filter { h ->
+            if (h.isVideo) h.id in liveVideoIds else h.id in livePhotoIds
+        }.take(topK)
+
+        val result: WritableArray = Arguments.createArray()
+        for (h in top) {
+            val base = if (h.isVideo)
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            else
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            result.pushMap(Arguments.createMap().apply {
+                putString("assetId", h.id.toString())
+                putString("uri", ContentUris.withAppendedId(base, h.id).toString())
+                putDouble("score", h.score.toDouble())
+                putBoolean("isVideo", h.isVideo)
+                putDouble("timestampMs", h.timestampMs.toDouble())
+            })
+        }
+        return result
     }
 
     /** Which of [ids] still resolve to a row under [baseUri] (i.e. weren't deleted). */

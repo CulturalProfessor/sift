@@ -25,6 +25,7 @@ import {
   onVideoProgress,
   openInGallery,
   openVideoAt,
+  searchByAsset,
   type LibraryStats,
   type SearchHit,
 } from '../native/SiftEmbedder';
@@ -78,9 +79,19 @@ function formatTimestamp(ms: number): string {
 }
 
 // CLIP cosine scores sit ~0.15-0.32 for good matches; map to a friendlier
-// "match %" so the number reads meaningfully to a user.
+// "match %" so the number reads meaningfully to a user. Prompt-templated
+// queries (see native/search.ts) shift this distribution vs. raw-query
+// scores, so these need re-tuning against real on-device queries.
+const SCORE_FLOOR = 0.1; // score mapped to 0%
+const SCORE_CEILING = 0.3; // score mapped to 100%
 function matchPercent(score: number): number {
-  return Math.max(1, Math.min(99, Math.round(((score - 0.1) / 0.2) * 100)));
+  return Math.max(
+    1,
+    Math.min(
+      99,
+      Math.round(((score - SCORE_FLOOR) / (SCORE_CEILING - SCORE_FLOOR)) * 100),
+    ),
+  );
 }
 
 /** Gently pulsing dot for the "indexing" status. */
@@ -243,6 +254,8 @@ export function PhotoGridScreen() {
   const [viewerItem, setViewerItem] = useState<SearchHit | null>(null);
   const [matchMin, setMatchMin] = useState(DEFAULT_MATCH_MIN);
   const [topK, setTopK] = useState(DEFAULT_TOP_K);
+  // Non-null while showing "find similar" results instead of a text search.
+  const [similarTo, setSimilarTo] = useState<SearchHit | null>(null);
 
   useEffect(() => {
     requestMediaPermission().then(granted =>
@@ -400,16 +413,22 @@ export function PhotoGridScreen() {
 
   useEffect(() => {
     if (query.trim() === '') {
-      // Invalidate any in-flight search so a late result can't repopulate the
-      // cleared grid ("30 results for '' ").
-      searchSeq.current++;
-      setResults(null);
-      setSearching(false);
+      // A "find similar" run also clears the query (to swap out of text-search
+      // mode) — don't invalidate that in-flight request here, only a genuine
+      // clear-to-empty.
+      if (similarTo === null) {
+        // Invalidate any in-flight search so a late result can't repopulate
+        // the cleared grid ("30 results for '' ").
+        searchSeq.current++;
+        setResults(null);
+        setSearching(false);
+      }
       return;
     }
+    setSimilarTo(null);
     const t = setTimeout(() => runSearch(query), 350);
     return () => clearTimeout(t);
-  }, [query, runSearch]);
+  }, [query, runSearch, similarTo]);
 
   const pickExample = useCallback(
     (q: string) => {
@@ -422,11 +441,33 @@ export function PhotoGridScreen() {
   const clearSearch = useCallback(() => {
     setQuery('');
     setResults(null);
+    setSimilarTo(null);
   }, []);
 
-  // Only treat results as "showable" when the query is non-empty — guards
-  // against a stale in-flight search landing after the field was cleared.
-  const hasResults = query.trim() !== '' && results !== null;
+  // "Find similar": no text query involved, so it bypasses runSearch/searchByText
+  // and hits the instant asset-embedding search directly.
+  const searchSimilar = useCallback(
+    async (item: SearchHit) => {
+      const seq = ++searchSeq.current;
+      setQuery('');
+      setSimilarTo(item);
+      setSearching(true);
+      try {
+        const hits = await searchByAsset(item.assetId, item.isVideo, topK);
+        if (seq === searchSeq.current) setResults(hits);
+      } catch (e) {
+        console.log('find similar error', e);
+      } finally {
+        if (seq === searchSeq.current) setSearching(false);
+      }
+    },
+    [topK],
+  );
+
+  // Only treat results as "showable" once a text query or a "find similar"
+  // is active — guards against a stale in-flight search landing after the
+  // query was cleared.
+  const hasResults = (query.trim() !== '' || similarTo !== null) && results !== null;
   // Only surface confident matches.
   const shownResults = (results ?? []).filter(
     r => matchPercent(r.score) >= matchMin,
@@ -463,7 +504,7 @@ export function PhotoGridScreen() {
           returnKeyType="search"
           autoCapitalize="none"
         />
-        {query !== '' ? (
+        {query !== '' || similarTo !== null ? (
           <Pressable style={styles.iconButton} onPress={clearSearch}>
             <Text style={styles.iconButtonText}>✕</Text>
           </Pressable>
@@ -479,7 +520,9 @@ export function PhotoGridScreen() {
 
       {hasResults && !searching && shownResults.length > 0 && (
         <Text style={styles.resultCount}>
-          {shownResults.length} results for “{query.trim()}”
+          {similarTo
+            ? `${shownResults.length} similar items`
+            : `${shownResults.length} results for “${query.trim()}”`}
         </Text>
       )}
 
@@ -494,7 +537,9 @@ export function PhotoGridScreen() {
       ) : shownResults.length === 0 ? (
         <View style={styles.noMatch}>
           <Text style={styles.noMatchText}>
-            No strong matches for “{query.trim()}”.
+            {similarTo
+              ? 'No strong similar matches.'
+              : `No strong matches for “${query.trim()}”.`}
           </Text>
           <Text style={styles.noMatchHint}>
             Try describing it differently, or index more of your library.
@@ -516,6 +561,10 @@ export function PhotoGridScreen() {
               }
               onLongPress={() =>
                 Alert.alert('', undefined, [
+                  {
+                    text: 'Find Similar',
+                    onPress: () => searchSimilar(item),
+                  },
                   {
                     text: 'Open in Gallery',
                     onPress: () => openInGallery(item.uri, item.isVideo),
@@ -570,6 +619,16 @@ export function PhotoGridScreen() {
           )}
           {viewerItem && (
             <View style={styles.viewerActions}>
+              <Pressable
+                style={styles.openGalleryBtn}
+                onPress={() => {
+                  const item = viewerItem;
+                  setViewerItem(null);
+                  searchSimilar(item);
+                }}
+              >
+                <Text style={styles.openGalleryText}>Find Similar</Text>
+              </Pressable>
               <Pressable
                 style={styles.openGalleryBtn}
                 onPress={() => openInGallery(viewerItem.uri, false)}

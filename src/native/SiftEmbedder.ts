@@ -42,6 +42,11 @@ interface SiftEmbedderNative {
     topK: number,
     token: number,
   ): Promise<SearchHit[]>;
+  searchByAsset(
+    assetId: number,
+    isVideo: boolean,
+    topK: number,
+  ): Promise<SearchHit[]>;
   indexGallery(maxCount: number): Promise<IndexResult>;
   indexVideos(maxCount: number): Promise<VideoIndexResult>;
   indexedCount(): Promise<number>;
@@ -95,6 +100,15 @@ export function searchImages(
   topK: number,
 ): Promise<SearchHit[]> {
   return SiftEmbedder.searchImages(queryEmbedding, topK, ++searchToken);
+}
+
+/** "Find similar": search using a stored asset's own embedding — no inference, near-instant. */
+export function searchByAsset(
+  assetId: string,
+  isVideo: boolean,
+  topK: number,
+): Promise<SearchHit[]> {
+  return SiftEmbedder.searchByAsset(Number(assetId), isVideo, topK);
 }
 
 export function indexGallery(maxCount = 0): Promise<IndexResult> {

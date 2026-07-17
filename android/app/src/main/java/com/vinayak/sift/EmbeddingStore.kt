@@ -114,6 +114,19 @@ class EmbeddingStore(context: Context) :
         return out
     }
 
+    /** A single photo's embedding, or null if it isn't indexed. */
+    fun getPhotoEmbedding(assetId: Long): ByteArray? {
+        readableDatabase.query(
+            "embeddings",
+            arrayOf("embedding"),
+            "asset_id = ?",
+            arrayOf(assetId.toString()),
+            null, null, null,
+        ).use { c ->
+            return if (c.moveToFirst()) c.getBlob(0) else null
+        }
+    }
+
     fun count(): Int {
         readableDatabase.rawQuery("SELECT COUNT(*) FROM embeddings", null).use { c ->
             return if (c.moveToFirst()) c.getInt(0) else 0
@@ -209,6 +222,23 @@ class EmbeddingStore(context: Context) :
             "video_keyframes",
             arrayOf("video_id", "timestamp_ms", "embedding"),
             null, null, null, null, null,
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(Keyframe(c.getLong(0), c.getLong(1), c.getBlob(2)))
+            }
+        }
+        return out
+    }
+
+    /** A single video's keyframes, or empty if it isn't indexed. */
+    fun getVideoKeyframes(videoId: Long): List<Keyframe> {
+        val out = ArrayList<Keyframe>()
+        readableDatabase.query(
+            "video_keyframes",
+            arrayOf("video_id", "timestamp_ms", "embedding"),
+            "video_id = ?",
+            arrayOf(videoId.toString()),
+            null, null, null,
         ).use { c ->
             while (c.moveToNext()) {
                 out.add(Keyframe(c.getLong(0), c.getLong(1), c.getBlob(2)))
